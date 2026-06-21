@@ -1,3209 +1,3067 @@
 #ifdef BUILD_UBOOT
-#define ENABLE_DSI_INTERRUPT 0 
-
 #include <asm/arch/disp_drv_platform.h>
+
+extern s32 mt_set_gpio_out(u32 pin, u32 output);
+extern s32 mt_set_gpio_mode(u32 pin, u32 mode);
+extern s32 mt_set_gpio_dir(u32 pin, u32 dir);
+extern s32 mt_set_gpio_pull_enable(u32 pin, u32 enable);
+
 #else
-
-#define ENABLE_DSI_INTERRUPT 1
-
 #include <linux/delay.h>
-#include <disp_drv_log.h>
-#include <linux/time.h>
-#include <linux/string.h>
-#include <linux/mutex.h>
-#include "disp_drv_platform.h"
+#include <linux/fb.h>
+#include "mtkfb.h"
+#include <asm/uaccess.h>
 
-#include "lcd_reg.h"
+#include "disp_drv.h"
+#include <disp_drv_platform.h>
+#include "disp_drv_log.h"
 #include "lcd_drv.h"
-
-#include "dsi_reg.h"
+#include "lcm_drv.h"
+#include "dpi_drv.h"
 #include "dsi_drv.h"
+#include "dsi_reg.h"
+#include "disp_drv_platform.h"
+#include "debug.h"
+
+#include <linux/disp_assert_layer.h>
+
+#include <linux/interrupt.h>
+#include <linux/sched.h>
+#include <linux/semaphore.h>
+#include <linux/module.h>
+#include <linux/wait.h>
+#include <linux/kthread.h>
+#include <linux/mutex.h>
+#include "mach/mt_clkmgr.h"
+#include <linux/vmalloc.h>
+#include "mtkfb_info.h"
+extern unsigned int lcd_fps;
+extern BOOL is_early_suspended;
+extern struct semaphore sem_early_suspend;
 #endif
 
 extern unsigned int EnableVSyncLog;
 
-#if ENABLE_DSI_INTERRUPT
-#include <linux/sched.h>
-#include <linux/interrupt.h>
-#include <linux/wait.h>
-#include <mach/irqs.h>
-#include "mtkfb.h"
-static wait_queue_head_t _dsi_wait_queue;
-static wait_queue_head_t _dsi_dcs_read_wait_queue;
-static wait_queue_head_t _dsi_wait_bta_te;
-static wait_queue_head_t _dsi_wait_vm_done_queue;
-#endif
-static unsigned int _dsi_reg_update_wq_flag = 0;
-static DECLARE_WAIT_QUEUE_HEAD(_dsi_reg_update_wq);
+#define LCM_ESD_CHECK_MAX_COUNT 5
 
-#include "debug.h"
+// ---------------------------------------------------------------------------
+//  Local Variables
+// ---------------------------------------------------------------------------
 
-//#define ENABLE_DSI_ERROR_REPORT
+static const DISP_DRIVER *disp_drv = NULL;
+const LCM_DRIVER  *lcm_drv  = NULL;
+static LCM_PARAMS s_lcm_params= {0};
+LCM_PARAMS *lcm_params= &s_lcm_params;
+static LCD_IF_ID ctrl_if = LCD_IF_PARALLEL_0;
 
-/*
-#define PLL_BASE			(0xF0060000)
-#define DSI_PHY_BASE		(0xF0060B00)
-#define DSI_BASE            	(0xF0140000)
-*/
+static volatile int direct_link_layer = -1;
+static UINT32 disp_fb_bpp = 32;     ///ARGB8888
+static UINT32 disp_fb_pages = 2;     ///double buffer
 
-#if !(defined(CONFIG_MT6589_FPGA) || defined(BUILD_UBOOT))
-//#define DSI_MIPI_API
-#endif
+BOOL is_engine_in_suspend_mode = FALSE;
+BOOL is_lcm_in_suspend_mode    = FALSE;
+static UINT32 dal_layerPA;
+static UINT32 dal_layerVA;
 
-#include <mach/sync_write.h>
-#ifdef OUTREG32
-  #undef OUTREG32
-  #define OUTREG32(x, y) mt65xx_reg_sync_writel(y, x)
-#endif
+static unsigned long u4IndexOfLCMList = 0;
 
-#ifndef OUTREGBIT
-#define OUTREGBIT(TYPE,REG,bit,value)  \
-                    do {    \
-                        TYPE r = *((TYPE*)&INREG32(&REG));    \
-                        r.bit = value;    \
-                        OUTREG32(&REG, AS_UINT32(&r));    \
-                    } while (0)
-#endif
+#ifdef MT65XX_NEW_DISP	
+static wait_queue_head_t config_update_wq;
+static struct task_struct *config_update_task = NULL;
+static int config_update_task_wakeup = 0;
+extern atomic_t OverlaySettingDirtyFlag;
+extern atomic_t OverlaySettingApplied;
+extern unsigned int PanDispSettingPending;
+extern unsigned int PanDispSettingDirty;
+extern unsigned int PanDispSettingApplied;
 
-static PDSI_REGS const DSI_REG = (PDSI_REGS)(DSI_BASE);
-static PDSI_PHY_REGS const DSI_PHY_REG = (PDSI_PHY_REGS)(MIPI_CONFIG_BASE);
-static PDSI_CMDQ_REGS const DSI_CMDQ_REG = (PDSI_CMDQ_REGS)(DSI_BASE+0x180);
-static PLCD_REGS const LCD_REG = (PLCD_REGS)(LCD_BASE);
+extern unsigned int fb_pa;
 
-static MIPITX_CFG0_REG mipitx_con0;
-static MIPITX_CFG1_REG mipitx_con1;
-static MIPITX_CFG3_REG mipitx_con3;
-static MIPITX_CFG6_REG mipitx_con6;
-static MIPITX_CFG8_REG mipitx_con8;
-static MIPITX_CFG9_REG mipitx_con9;
+extern bool is_ipoh_bootup;
 
-extern LCM_DRIVER *lcm_drv;
-static bool dsi_log_on = false;
+extern struct mutex OverlaySettingMutex;
+extern wait_queue_head_t reg_update_wq;
+static wait_queue_head_t vsync_wq;
+static bool vsync_wq_flag = false;
 
-typedef struct
+static struct hrtimer cmd_mode_update_timer;
+static ktime_t cmd_mode_update_timer_period;
+
+static bool needStartEngine = false;
+
+extern unsigned int need_esd_check;
+extern wait_queue_head_t esd_check_wq;
+extern BOOL esd_kthread_pause;
+
+DEFINE_MUTEX(MemOutSettingMutex);
+static struct disp_path_config_mem_out_struct MemOutConfig;
+
+DEFINE_MUTEX(LcmCmdMutex);
+
+unsigned int disp_running = 0;
+DECLARE_WAIT_QUEUE_HEAD(disp_done_wq);
+
+OVL_CONFIG_STRUCT cached_layer_config[DDP_OVL_LAYER_MUN] = 
 {
-	DSI_REGS regBackup;
-	unsigned int cmdq_size;
-	DSI_CMDQ_REGS cmdqBackup;
-	unsigned int bit_time_ns;
-	unsigned int vfp_period_us;
-	unsigned int vsa_vs_period_us;
-	unsigned int vsa_hs_period_us;
-	unsigned int vsa_ve_period_us;
-	unsigned int vbp_period_us;
-    void (*pIntCallback)(DISP_INTERRUPT_EVENTS);
-} DSI_CONTEXT;
-
-static bool s_isDsiPowerOn = FALSE;
-static DSI_CONTEXT _dsiContext;
-extern LCM_PARAMS *lcm_params;
-
-DSI_PLL_CONFIG pll_config[50] =
-{{1,1,1,0x1E,1,2,3,8,4,0xC},
-{1,1,1,0x0F,0,2,2,4,1,0xC},
-{1,1,1,0x20,1,2,3,9,4,0xC},
-{1,1,1,0x10,0,2,2,4,1,0xC},
-{1,1,1,0x22,1,2,3,9,4,0xC},
-{1,1,1,0x11,0,2,2,4,1,0xC},
-{1,1,1,0x24,1,2,3,0xA,5,0xC},
-{1,1,1,0x12,0,2,2,5,2,0xC},
-{1,1,1,0x26,1,2,3,0xA,4,0xC},
-{1,1,1,0x13,0,2,2,5,2,0xC},
-{1,1,1,0x28,1,2,3,0xA,4,0xC},
-{1,1,1,0x14,0,2,2,5,2,0xC},
-{1,1,1,0x2A,1,2,3,0xB,5,0xC},
-{1,1,1,0x15,0,2,2,6,2,0xC},
-{1,1,1,0x2C,1,2,3,0xB,5,0xC},
-{1,1,1,0x16,0,2,2,6,2,0xC},
-{1,1,1,0x2E,1,2,3,0xC,5,0xC},
-{1,1,1,0x17,0,2,2,6,2,0xC},
-{1,1,1,0x30,1,2,3,0xD,5,0xC},
-{1,1,1,0x18,0,2,2,6,2,0xC},
-{1,1,1,0x32,1,2,3,0xE,6,0xC},
-{1,1,1,0x19,0,2,2,6,2,0xC},
-{1,1,1,0x34,1,1,3,0x7,6,0x6},
-{1,1,1,0x1A,0,2,2,7,2,0xC},
-{1,1,1,0x36,1,1,3,0x7,7,0x6},
-{1,0,0,0x1B,0,2,2,5,2,0x8},
-{1,0,0,0x38,1,2,2,0xA,5,0x8},
-{1,0,1,0x1C,1,2,2,0xA,5,0x8},
-{1,0,1,0x3A,3,1,3,5,3,0x8},
-{1,0,1,0x0E,0,2,2,5,2,0x9},
-{1,0,1,0x3C,3,1,3,5,3,0x8},
-{1,0,1,0x1E,1,1,2,5,5,0x4},
-{1,0,1,0x3E,3,1,3,5,3,0x8},
-{1,0,1,0x0F,0,2,2,5,2,0xA},
-{1,0,1,0x40,3,1,3,5,3,0x8},
-{1,0,1,0x20,1,1,2,6,5,0x4},
-{1,0,1,0x42,3,1,3,6,3,0x8},
-{1,0,1,0x10,0,2,2,6,2,0xA},
-{1,0,1,0x44,3,1,3,6,3,0x8},
-{1,0,1,0x22,1,1,2,6,6,0x4},
-{1,0,1,0x46,3,1,3,6,4,0x8},
-{1,0,1,0x11,0,2,2,5,2,0xA},
-{1,0,1,0x48,3,1,3,6,4,0x8},
-{1,0,1,0x24,1,1,2,6,6,0x4},
-{1,0,1,0x4A,3,1,3,7,4,0x8},
-{1,0,1,0x12,0,2,2,5,2,0xC},
-{1,0,1,0x4C,3,1,3,7,4,0x8},
-{1,0,1,0x26,1,1,2,7,6,0x4},
-{1,0,1,0x4E,3,1,3,7,4,0x8},
-{1,0,1,0x13,0,2,2,5,2,0xC},
+    {.layer = 0, .isDirty = 1},
+    {.layer = 1, .isDirty = 1},
+    {.layer = 2, .isDirty = 1},
+    {.layer = 3, .isDirty = 1}
 };
 
-#ifndef BUILD_UBOOT
+static OVL_CONFIG_STRUCT _layer_config[2][DDP_OVL_LAYER_MUN];
+static unsigned int layer_config_index = 0;
+OVL_CONFIG_STRUCT* captured_layer_config = _layer_config[0];
+OVL_CONFIG_STRUCT* realtime_layer_config = _layer_config[0];
 
-
-static bool dsi_esd_recovery = false;
-static bool dsi_noncont_clk_enabled = false;
-static unsigned int dsi_noncont_clk_period = 1;
-static bool dsi_int_te_enabled = false;
-static unsigned int dsi_int_te_period = 1;
-static unsigned int dsi_dpi_isr_count = 0;
-unsigned long g_handle_esd_flag;
-
-static volatile bool lcdStartTransfer = false;
-static volatile bool dsiTeEnable = true;
-
-#endif
-
-#ifdef BUILD_UBOOT
-static long int get_current_time_us(void)
+struct DBG_OVL_CONFIGS
 {
-    return 0;       ///TODO: fix me
-}
+    OVL_CONFIG_STRUCT Layer0;
+    OVL_CONFIG_STRUCT Layer1;
+    OVL_CONFIG_STRUCT Layer2;
+    OVL_CONFIG_STRUCT Layer3;
+};
+
+unsigned int gCaptureLayerEnable = 0;
+unsigned int gCaptureLayerDownX = 10;
+unsigned int gCaptureLayerDownY = 10;
+
+struct task_struct *captureovl_task = NULL;
+static int _DISP_CaptureOvlKThread(void *data);
+static unsigned int gWakeupCaptureOvlThread = 0;
+unsigned int gCaptureOvlThreadEnable = 0;
+unsigned int gCaptureOvlDownX = 10;
+unsigned int gCaptureOvlDownY = 10;
+
+struct task_struct *capturefb_task = NULL;
+static int _DISP_CaptureFBKThread(void *data);
+#ifdef USER_BUILD_KERNEL
+unsigned int gCaptureFBEnable = 0;
 #else
-static long int get_current_time_us(void)
-{
-    struct timeval t;
-    do_gettimeofday(&t);
-    return (t.tv_sec & 0xFFF) * 1000000 + t.tv_usec;
-}
+unsigned int gCaptureFBEnable = 0;
 #endif
+unsigned int gCaptureFBDownX = 10;
+unsigned int gCaptureFBDownY = 10;
+unsigned int gCaptureFBPeriod = 100;
+DECLARE_WAIT_QUEUE_HEAD(gCaptureFBWQ);
+
+extern struct fb_info *mtkfb_fbi;
+
+unsigned int is_video_mode_running = 0;
+#endif
+
+DEFINE_SEMAPHORE(sem_update_screen);//linux 3.0 porting
+static BOOL isLCMFound 					= FALSE;
+/// Some utilities
+#define ALIGN_TO_POW_OF_2(x, n)  \
+	(((x) + ((n) - 1)) & ~((n) - 1))
+
+#define ALIGN_TO(x, n)  \
+	(((x) + ((n) - 1)) & ~((n) - 1))
+
+
+
+static size_t disp_log_on = false;
+#define DISP_LOG(fmt, arg...) \
+    do { \
+        if (disp_log_on) DISP_LOG_PRINT(ANDROID_LOG_WARN, "COMMON", fmt, ##arg); \
+    }while (0)
+
+#define DISP_FUNC()	\
+	do { \
+		if(disp_log_on) DISP_LOG_PRINT(ANDROID_LOG_INFO, "COMMON", "[Func]%s\n", __func__); \
+	}while (0)
+
+void disp_log_enable(int enable)
+{
+    disp_log_on = enable;
+	DISP_LOG("disp common log %s\n", enable?"enabled":"disabled");
+}
+// ---------------------------------------------------------------------------
+//  Local Functions
+// ---------------------------------------------------------------------------
+
+static void lcm_set_reset_pin(UINT32 value)
+{
+	int ret = 0;
+	if(LCM_TYPE_DSI == lcm_params->type){
+		ret = enable_clock(MT_CG_DISP1_DBI_ENGINE, "DSI_LRST");
+	}
+	LCD_SetResetSignal(value);
+	if(LCM_TYPE_DSI == lcm_params->type){
+		ret	+= disable_clock(MT_CG_DISP1_DBI_ENGINE, "DSI_LRST");
+	}
+	if(ret > 0)
+	{
+		printk("[DSI_LRST]power manager API return FALSE\n");
+	}   
+}
+
+static void lcm_udelay(UINT32 us)
+{
+	udelay(us);
+}
+
 static void lcm_mdelay(UINT32 ms)
 {
-    udelay(1000 * ms);
+	msleep(ms);
 }
-void DSI_Enable_Log(bool enable)
+
+static void lcm_send_cmd(UINT32 cmd)
 {
-	dsi_log_on = enable;
+	if(lcm_params== NULL)
+		return;
+
+    ASSERT(LCM_CTRL_SERIAL_DBI   == lcm_params->ctrl ||
+           LCM_CTRL_PARALLEL_DBI == lcm_params->ctrl);
+
+    LCD_CHECK_RET(LCD_WriteIF(ctrl_if, LCD_IF_A0_LOW,
+                              cmd, lcm_params->dbi.cpu_write_bits));
 }
-static wait_queue_head_t _vsync_wait_queue;
-static bool dsi_vsync = false;
-static bool wait_dsi_vsync = false;
-static struct hrtimer hrtimer_vsync;
-#define VSYNC_US_TO_NS(x) (x * 1000)
-static unsigned int vsync_timer = 0;
 
-#if ENABLE_DSI_INTERRUPT
-static irqreturn_t _DSI_InterruptHandler(int irq, void *dev_id)
-{   
-    DSI_INT_STATUS_REG status = DSI_REG->DSI_INTSTA;
-    static unsigned int prev_error = 0;
-
-    MMProfileLogEx(MTKFB_MMP_Events.DSIIRQ, MMProfileFlagPulse, *(unsigned int*)&status, lcdStartTransfer);
-	if(dsi_log_on)
-		printk("DSI IRQ, value = 0x%x!!\n", INREG32(0xF400D00C));
-	
-    if (status.RD_RDY)
-    {        
-        ///write clear RD_RDY interrupt 
-
-        /// write clear RD_RDY interrupt must be before DSI_RACK
-        /// because CMD_DONE will raise after DSI_RACK, 
-        /// so write clear RD_RDY after that will clear CMD_DONE too
-#ifdef ENABLE_DSI_ERROR_REPORT
-        {
-            unsigned int read_data[4];
-			OUTREG32(&read_data[0], AS_UINT32(&DSI_REG->DSI_RX_DATA0));
-			OUTREG32(&read_data[1], AS_UINT32(&DSI_REG->DSI_RX_DATA1));
-			OUTREG32(&read_data[2], AS_UINT32(&DSI_REG->DSI_RX_DATA2));
-			OUTREG32(&read_data[3], AS_UINT32(&DSI_REG->DSI_TRIG_STA));
-            if (dsi_log_on)
-            {
-				if ((read_data[0] & 0x3) == 0x02)
-				{
-					if (read_data[0] & (~prev_error))
-						printk("[DSI] Detect DSI error. prev:0x%08X new:0x%08X\n", prev_error, read_data[0]);
-				}
-				else if ((read_data[1] & 0x3) == 0x02)
-				{
-					if (read_data[1] & (~prev_error))
-						printk("[DSI] Detect DSI error. prev:0x%08X new:0x%08X\n", prev_error, read_data[1]);
-				}
-            }
-            MMProfileLogEx(MTKFB_MMP_Events.DSIRead, MMProfileFlagStart, read_data[0], read_data[1]);
-            MMProfileLogEx(MTKFB_MMP_Events.DSIRead, MMProfileFlagEnd, read_data[2], read_data[3]);
-        }
-#endif
-		do
-        {
-            ///send read ACK
-            //DSI_REG->DSI_RACK.DSI_RACK = 1;
-            OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-        } while(DSI_REG->DSI_INTSTA.BUSY);
-
-        MASKREG32(&DSI_REG->DSI_INTSTA, 0x1, 0x0);
-		wake_up_interruptible(&_dsi_dcs_read_wait_queue);
-        if(_dsiContext.pIntCallback)
-            _dsiContext.pIntCallback(DISP_DSI_READ_RDY_INT);   
-    }
-
-    if (status.CMD_DONE)
-    {
-    	if (lcdStartTransfer)
-        {
-            // The last screen update has finished.
-            if(_dsiContext.pIntCallback)
-                _dsiContext.pIntCallback(DISP_DSI_CMD_DONE_INT);
-			DBG_OnLcdDone();
-        }
-
-		// clear flag & wait for next trigger
-		lcdStartTransfer = false;
-	
-        //DSI_REG->DSI_INTSTA.CMD_DONE = 0;
-        OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,CMD_DONE,0);
-		
-        wake_up_interruptible(&_dsi_wait_queue);
-        //if(_dsiContext.pIntCallback)
-        //    _dsiContext.pIntCallback(DISP_DSI_CMD_DONE_INT);   
-		//MASKREG32(&DSI_REG->DSI_INTSTA, 0x2, 0x0);
-    }
-
-    if (status.TE_RDY)
-    {
-		DBG_OnTeDelayDone();
-
-		// Write clear RD_RDY
-		//DSI_REG->DSI_INTSTA.TE_RDY = 0;
-		OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,TE_RDY,0);
-
-		// Set DSI_RACK to let DSI idle
-		//DSI_REG->DSI_RACK.DSI_RACK = 1;
-		OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-		
-		wake_up_interruptible(&_dsi_wait_bta_te);
-
-		
-#ifndef BUILD_UBOOT    
-        if(wait_dsi_vsync)//judge if wait vsync
-        {
-            if (EnableVSyncLog)
-                printk("[DSI] VSync2\n");
-            if(-1 != hrtimer_try_to_cancel(&hrtimer_vsync))
-            {
-                dsi_vsync = true;
-                //hrtimer_try_to_cancel(&hrtimer_vsync);
-                if (EnableVSyncLog)
-                    printk("[DSI] VSync3\n");
-                wake_up_interruptible(&_vsync_wait_queue);
-            }
-            //printk("TE signal, and wake up\n");
-        }
-#endif  
-    }
-
-	if (status.VM_DONE)
-    {
-//		DBG_OnTeDelayDone();
-        OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,VM_DONE,0);
-        if(_dsiContext.pIntCallback)
-            _dsiContext.pIntCallback(DISP_DSI_VMDONE_INT);
-		if(dsi_log_on)
-			printk("DSI VM done IRQ!!\n");
-		// Write clear VM_Done
-		//DSI_REG->DSI_INTSTA.VM_DONE= 0;
-		wake_up_interruptible(&_dsi_wait_vm_done_queue);
-    }
-
-    return IRQ_HANDLED;
-	
-}
-#endif
-#ifndef BUILD_UBOOT
-void DSI_GetVsyncCnt()
+static void lcm_send_data(UINT32 data)
 {
+	if(lcm_params== NULL)
+		return;
+
+    ASSERT(LCM_CTRL_SERIAL_DBI   == lcm_params->ctrl ||
+           LCM_CTRL_PARALLEL_DBI == lcm_params->ctrl);
+
+    LCD_CHECK_RET(LCD_WriteIF(ctrl_if, LCD_IF_A0_HIGH,
+                              data, lcm_params->dbi.cpu_write_bits));
 }
-enum hrtimer_restart dsi_te_hrtimer_func(struct hrtimer *timer)
+
+static UINT32 lcm_read_data(void)
 {
-//	long long ret;
-    if (EnableVSyncLog)
-        printk("[DSI] VSync0\n");
-	if(wait_dsi_vsync)
+	UINT32 data = 0;
+
+	if(lcm_params== NULL)
+		return 0;
+
+	ASSERT(LCM_CTRL_SERIAL_DBI   == lcm_params->ctrl ||
+			LCM_CTRL_PARALLEL_DBI == lcm_params->ctrl);
+
+	LCD_CHECK_RET(LCD_ReadIF(ctrl_if, LCD_IF_A0_HIGH,
+				&data, lcm_params->dbi.cpu_write_bits));
+
+	return data;
+}
+
+static __inline LCD_IF_WIDTH to_lcd_if_width(LCM_DBI_DATA_WIDTH data_width)
+{
+	switch(data_width)
 	{
-		dsi_vsync = true;
-
-        if (EnableVSyncLog)
-            printk("[DSI] VSync1\n");
-		wake_up_interruptible(&_vsync_wait_queue);
+		case LCM_DBI_DATA_WIDTH_8BITS  : return LCD_IF_WIDTH_8_BITS;
+		case LCM_DBI_DATA_WIDTH_9BITS  : return LCD_IF_WIDTH_9_BITS;
+		case LCM_DBI_DATA_WIDTH_16BITS : return LCD_IF_WIDTH_16_BITS;
+		case LCM_DBI_DATA_WIDTH_18BITS : return LCD_IF_WIDTH_18_BITS;
+		case LCM_DBI_DATA_WIDTH_24BITS : return LCD_IF_WIDTH_24_BITS;
+		default : ASSERT(0);
 	}
-//	ret = hrtimer_forward_now(timer, ktime_set(0, VSYNC_US_TO_NS(vsync_timer)));
-//	printk("hrtimer callback\n");
+	return LCD_IF_WIDTH_18_BITS;
+}
+
+static void disp_drv_set_driving_current(LCM_PARAMS *lcm)
+{
+	LCD_Set_DrivingCurrent(lcm);
+}
+
+static void disp_drv_init_io_pad(LCM_PARAMS *lcm)
+{
+	LCD_Init_IO_pad(lcm);
+}
+
+static void disp_drv_init_ctrl_if(void)
+{
+	const LCM_DBI_PARAMS *dbi = NULL;
+
+	if(lcm_params== NULL)
+		return;
+
+	dbi = &(lcm_params->dbi);
+	switch(lcm_params->ctrl)
+	{
+		case LCM_CTRL_NONE :
+		case LCM_CTRL_GPIO : return;
+
+		case LCM_CTRL_SERIAL_DBI :
+							 ASSERT(dbi->port <= 1);
+#ifdef MT65XX_NEW_DISP
+							LCD_CHECK_RET(LCD_Init());
+#endif
+							 ctrl_if = LCD_IF_SERIAL_0 + dbi->port;
+#if (MTK_LCD_HW_SIF_VERSION == 1)
+							 LCD_ConfigSerialIF(ctrl_if,
+									 (LCD_IF_SERIAL_BITS)dbi->data_width,
+									 dbi->serial.clk_polarity,
+									 dbi->serial.clk_phase,
+									 dbi->serial.cs_polarity,
+									 dbi->serial.clock_base,
+									 dbi->serial.clock_div,
+									 dbi->serial.is_non_dbi_mode);
+#else    ///(MTK_LCD_HW_SIF_VERSION == 2)
+							 LCD_ConfigSerialIF(ctrl_if,
+									 (LCD_IF_SERIAL_BITS)dbi->data_width,
+									 dbi->serial.sif_3wire,
+									 dbi->serial.sif_sdi,
+									 dbi->serial.sif_1st_pol,
+									 dbi->serial.sif_sck_def,
+									 dbi->serial.sif_div2,
+									 dbi->serial.sif_hw_cs,
+									 dbi->serial.css,
+									 dbi->serial.csh,
+									 dbi->serial.rd_1st,
+									 dbi->serial.rd_2nd,
+									 dbi->serial.wr_1st,
+									 dbi->serial.wr_2nd);
+#endif
+                             break;
+
+		case LCM_CTRL_PARALLEL_DBI :
+							 ASSERT(dbi->port <= 2);
+#ifdef MT65XX_NEW_DISP
+							LCD_CHECK_RET(LCD_Init());
+#endif
+							 ctrl_if = LCD_IF_PARALLEL_0 + dbi->port;
+							 LCD_ConfigParallelIF(ctrl_if,
+									 (LCD_IF_PARALLEL_BITS)dbi->data_width,
+									 (LCD_IF_PARALLEL_CLK_DIV)dbi->clock_freq,
+									 dbi->parallel.write_setup,
+									 dbi->parallel.write_hold,
+									 dbi->parallel.write_wait,
+									 dbi->parallel.read_setup,
+									 dbi->parallel.read_hold,
+									 dbi->parallel.read_latency,
+									 dbi->parallel.wait_period,
+									 dbi->parallel.cs_high_width);
+							 break;
+
+		default : ASSERT(0);
+	}
+
+	LCD_CHECK_RET(LCD_SelectWriteIF(ctrl_if));
+
+	LCD_CHECK_RET(LCD_ConfigIfFormat(dbi->data_format.color_order,
+				dbi->data_format.trans_seq,
+				dbi->data_format.padding,
+				dbi->data_format.format,
+				to_lcd_if_width(dbi->data_format.width)));
+}
+
+static const LCM_UTIL_FUNCS lcm_utils =
+{
+	.set_reset_pin      = lcm_set_reset_pin,
+	.udelay             = lcm_udelay,
+	.mdelay             = lcm_mdelay,
+	.send_cmd           = lcm_send_cmd,
+	.send_data          = lcm_send_data,
+	.read_data          = lcm_read_data,
+    .dsi_set_cmdq		= (void (*)(unsigned int *, unsigned int, unsigned char))DSI_set_cmdq,
+	.dsi_set_cmdq_V2	= DSI_set_cmdq_V2,
+	.dsi_set_cmdq_V3	= (void (*)(LCM_setting_table_V3 *, unsigned int, unsigned char))DSI_set_cmdq_V3,	
+	.dsi_write_cmd		= DSI_write_lcm_cmd,
+	.dsi_write_regs 	= DSI_write_lcm_regs,
+	.dsi_read_reg		= DSI_read_lcm_reg,
+	.dsi_dcs_read_lcm_reg       = DSI_dcs_read_lcm_reg,
+	.dsi_dcs_read_lcm_reg_v2    = DSI_dcs_read_lcm_reg_v2,
+	/** FIXME: GPIO mode should not be configured in lcm driver
+	  REMOVE ME after GPIO customization is done    
+	 */
+	.set_gpio_out       = mt_set_gpio_out,
+	.set_gpio_mode        = mt_set_gpio_mode,
+	.set_gpio_dir         = mt_set_gpio_dir,
+	.set_gpio_pull_enable = (int (*)(unsigned int, unsigned char))mt_set_gpio_pull_enable
+};
+
+
+
+extern LCM_DRIVER* lcm_driver_list[];
+extern unsigned int lcm_count;
+extern void init_dsi(BOOL isDsiPoweredOn);
+const LCM_DRIVER *disp_drv_get_lcm_driver(const char *lcm_name)
+{
+	LCM_DRIVER *lcm = NULL;
+	printk("[LCM Auto Detect], we have %d lcm drivers built in\n", lcm_count);
+	printk("[LCM Auto Detect], try to find driver for [%s]\n", 
+			(lcm_name==NULL)?"unknown":lcm_name);
+
+	if(lcm_count ==1)
+	{
+		// we need to verify whether the lcm is connected
+		// even there is only one lcm type defined
+		lcm = lcm_driver_list[0];
+		lcm->set_util_funcs(&lcm_utils);
+		lcm->get_params(&s_lcm_params);
+		u4IndexOfLCMList = 0;
+
+		lcm_params = &s_lcm_params;
+		lcm_drv = lcm;
+/*
+		disp_drv_init_ctrl_if();
+		disp_drv_set_driving_current(lcm_params);
+		disp_drv_init_io_pad(lcm_params);
+
+		if(lcm_drv->compare_id)
+		{
+            BOOL id_equal;
+			if(LCM_TYPE_DSI == lcm_params->type){
+				init_dsi(FALSE);
+			}
+            mutex_lock(&LcmCmdMutex);
+            id_equal = lcm_drv->compare_id();
+            mutex_unlock(&LcmCmdMutex);
+
+			if(id_equal == TRUE)
+			{
+				printk("[LCM Specified] compare id success\n");
+				isLCMFound = TRUE;
+			}
+			else
+			{
+				printk("[LCM Specified] compare id fail\n");
+				printk("%s, lcm is not connected\n", __func__);
+
+				if(LCM_TYPE_DSI == lcm_params->type)
+					DSI_Deinit();
+			}
+		}
+		else
+*/
+		{
+			isLCMFound = TRUE;
+		}
+
+        printk("[LCM Specified]\t[%s]\n", (lcm->name==NULL)?"unknown":lcm->name);
+
+		goto done;
+	}
+	else
+	{
+		int i;
+
+		for(i = 0;i < lcm_count;i++)
+		{
+			lcm_params = &s_lcm_params;
+			lcm = lcm_driver_list[i];
+
+			printk("[LCM Auto Detect] [%d] - [%s]\t", i, (lcm->name==NULL)?"unknown":lcm->name);
+
+			lcm->set_util_funcs(&lcm_utils);
+			memset((void*)lcm_params, 0, sizeof(LCM_PARAMS));
+			lcm->get_params(lcm_params);
+
+			disp_drv_init_ctrl_if();
+			disp_drv_set_driving_current(lcm_params);
+			disp_drv_init_io_pad(lcm_params);
+
+			if(lcm_name != NULL)
+			{
+				if(!strcmp(lcm_name,lcm->name))
+				{
+					printk("\t\t[success]\n");
+					isLCMFound = TRUE;
+                                   u4IndexOfLCMList = i;
+					lcm_drv = lcm;
+
+					goto done;
+				}
+				else
+				{
+					printk("\t\t[fail]\n");
+				}
+			}
+			else 
+			{
+				if(LCM_TYPE_DSI == lcm_params->type){
+					init_dsi(FALSE);
+				}
+
+				if(lcm->compare_id != NULL && lcm->compare_id())
+				{
+					printk("\t\t[success]\n");
+					isLCMFound = TRUE;
+					lcm_drv = lcm;
+                                   u4IndexOfLCMList = i;
+					goto done;
+				}
+				else
+				{
+				
+					if(LCM_TYPE_DSI == lcm_params->type)
+						DSI_Deinit();
+					printk("\t\t[fail]\n");
+				}
+			}
+		}
+	}
+done:
+	return lcm_drv;
+}
+
+
+static void disp_dump_lcm_parameters(LCM_PARAMS *lcm_params)
+{
+	unsigned char *LCM_TYPE_NAME[] = {"DBI", "DPI", "DSI"};
+	unsigned char *LCM_CTRL_NAME[] = {"NONE", "SERIAL", "PARALLEL", "GPIO"};
+
+	if(lcm_params == NULL)
+		return;
+
+	printk("[mtkfb] LCM TYPE: %s\n", LCM_TYPE_NAME[lcm_params->type]);
+	printk("[mtkfb] LCM INTERFACE: %s\n", LCM_CTRL_NAME[lcm_params->ctrl]);
+	printk("[mtkfb] LCM resolution: %d x %d\n", lcm_params->width, lcm_params->height);
+
+	return;
+}
+
+char disp_lcm_name[256] = {0};
+BOOL disp_get_lcm_name_boot(char *cmdline)
+{
+	BOOL ret = FALSE;
+	char *p, *q;
+
+	p = strstr(cmdline, "lcm=");
+	if(p == NULL)
+	{
+		// we can't find lcm string in the command line, 
+		// the uboot should be old version, or the kernel is loaded by ICE debugger
+		return DISP_SelectDeviceBoot(NULL);
+	}
+
+	p += 4;
+	if((p - cmdline) > strlen(cmdline+1))
+	{
+		ret = FALSE;
+		goto done;
+	}
+
+	isLCMFound = strcmp(p, "0");
+	printk("[mtkfb] LCM is %sconnected\n", ((isLCMFound)?"":"not "));
+	p += 2;
+	q = p;
+	while(*q != ' ' && *q != '\0')
+		q++;
+
+	memset((void*)disp_lcm_name, 0, sizeof(disp_lcm_name));
+	strncpy((char*)disp_lcm_name, (const char*)p, (int)(q-p));
+
+	if(DISP_SelectDeviceBoot(disp_lcm_name))
+		ret = TRUE;
+
+done:
+	return ret;
+}
+
+static BOOL disp_drv_init_context(void)
+{
+	if (disp_drv != NULL && lcm_drv != NULL){
+		return TRUE;
+	}
+
+    if(!isLCMFound)
+	    DISP_DetectDevice();
+    
+	disp_drv_init_ctrl_if();
+
+	switch(lcm_params->type)
+	{
+		case LCM_TYPE_DBI : disp_drv = DISP_GetDriverDBI(); break;
+		case LCM_TYPE_DPI : disp_drv = DISP_GetDriverDPI(); break;
+		case LCM_TYPE_DSI : disp_drv = DISP_GetDriverDSI(); break;
+		default : ASSERT(0);
+	}
+
+	if (!disp_drv) return FALSE;
+
+	return TRUE;
+}
+
+BOOL DISP_IsLCDBusy(void)
+{
+	return LCD_IsBusy();
+}
+
+BOOL DISP_IsLcmFound(void)
+{
+	return isLCMFound;
+}
+
+BOOL DISP_IsContextInited(void)
+{
+	if(lcm_params && disp_drv && lcm_drv)
+		return TRUE;
+	else
+		return FALSE;
+}
+
+BOOL DISP_SelectDeviceBoot(const char* lcm_name)
+{
+	LCM_DRIVER *lcm = NULL;
+	int i;
+
+	printk("%s\n", __func__);
+	if(lcm_name == NULL)
+	{
+		// we can't do anything in boot stage if lcm_name is NULL
+		return false;
+	}
+	for(i = 0;i < lcm_count;i++)
+	{
+		lcm_params = &s_lcm_params;
+		lcm = lcm_driver_list[i];
+
+		printk("[LCM Auto Detect] [%d] - [%s]\t", 
+			i, 
+			(lcm->name==NULL)?"unknown":lcm->name);
+
+		lcm->set_util_funcs(&lcm_utils);
+		memset((void*)lcm_params, 0, sizeof(LCM_PARAMS));
+		lcm->get_params(lcm_params);
+
+		// if lcm type is speficied, we don't need to compare the lcm name
+		// in case the uboot is old version, which don't have lcm name in command line
+		if(lcm_count == 1)
+		{
+			lcm_drv = lcm;
+			isLCMFound = true;
+			u4IndexOfLCMList = 0;
+			break;
+		}
+
+		if(!strcmp(lcm_name,lcm->name))
+		{
+			printk("\t\t[success]\n");
+			u4IndexOfLCMList = i;
+			lcm_drv = lcm;
+			isLCMFound = TRUE;
+
+			break;
+		}
+		else
+		{
+			printk("\t\t[fail]\n");
+		}
+	}
+
+	if (NULL == lcm_drv)
+	{
+		printk("%s, disp_drv_get_lcm_driver() returns NULL\n", __func__);
+		return FALSE;
+	}
+
+	switch(lcm_params->type)
+	{
+		case LCM_TYPE_DBI : disp_drv = DISP_GetDriverDBI(); break;
+		case LCM_TYPE_DPI : disp_drv = DISP_GetDriverDPI(); break;
+		case LCM_TYPE_DSI : disp_drv = DISP_GetDriverDSI(); break;
+		default : ASSERT(0);
+	}
+
+	disp_dump_lcm_parameters(lcm_params);
+	return TRUE;
+}
+
+BOOL DISP_SelectDevice(const char* lcm_name)
+{
+
+#ifndef MT65XX_NEW_DISP
+	LCD_STATUS ret;
+	ret = LCD_Init();
+	printk("ret of LCD_Init() = %d\n", ret);
+#endif
+
+	lcm_drv = disp_drv_get_lcm_driver(lcm_name);
+	if (NULL == lcm_drv)
+	{
+		printk("%s, disp_drv_get_lcm_driver() returns NULL\n", __func__);
+		return FALSE;
+	}
+
+	disp_dump_lcm_parameters(lcm_params);
+	return disp_drv_init_context();
+}
+
+BOOL DISP_DetectDevice(void)
+{
+#ifndef MT65XX_NEW_DISP
+	LCD_STATUS ret;
+	ret = LCD_Init();
+	printk("ret of LCD_Init() = %d\n", ret);
+#endif
+
+	lcm_drv = disp_drv_get_lcm_driver(NULL);
+	if (NULL == lcm_drv)
+	{
+		printk("%s, disp_drv_get_lcm_driver() returns NULL\n", __func__);
+		return FALSE;
+	}
+
+	disp_dump_lcm_parameters(lcm_params);
+
+	return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+//  DISP Driver Implementations
+// ---------------------------------------------------------------------------
+extern mtk_dispif_info_t dispif_info[MTKFB_MAX_DISPLAY_COUNT];
+
+DISP_STATUS DISP_Init(UINT32 fbVA, UINT32 fbPA, BOOL isLcmInited)
+{
+    DISP_STATUS r = DISP_STATUS_OK;
+
+#ifdef MT65XX_NEW_DISP
+#if 0
+	//OUTREG32(DISPSYS_BASE + 0x104, 0xffffffff);//set CG
+	OUTREG32(DISPSYS_BASE + 0x108, 0xffffffff);
+	//OUTREG32(DISPSYS_BASE + 0x114, 0xffffffff);
+	OUTREG32(DISPSYS_BASE + 0x118, 0xffffffff);
+	OUTREG32(DISPSYS_BASE + 0xC08, 0x1);
+#endif
+#endif
+    captureovl_task = kthread_create(_DISP_CaptureOvlKThread, NULL, "disp_captureovl_kthread");
+    if (IS_ERR(captureovl_task))
+    {
+        DISP_LOG("DISP_InitVSYNC(): Cannot create capture ovl kthread\n");
+    }
+    if (gWakeupCaptureOvlThread)
+	    wake_up_process(captureovl_task);
+
+    capturefb_task = kthread_create(_DISP_CaptureFBKThread, mtkfb_fbi, "disp_capturefb_kthread");
+    if (IS_ERR(capturefb_task))
+    {
+        DISP_LOG("DISP_InitVSYNC(): Cannot create capture fb kthread\n");
+    }
+	wake_up_process(capturefb_task);
+
+	if (!disp_drv_init_context()) {
+        return DISP_STATUS_NOT_IMPLEMENTED;
+    }
+
+//	/* power on LCD before config its registers*/
+//	LCD_CHECK_RET(LCD_Init());
+
+    disp_drv_init_ctrl_if();
+	disp_path_clock_on("mtkfb");
+    if(clk_is_force_on(MT_CG_DISP0_LARB2_SMI)==0)
+    {
+        printk("[DDP] error, MT_CG_DISP0_LARB2_SMI is not force on\n");
+    }
+    else
+    {
+        //printk("[DDP] MT_CG_DISP0_LARB2_SMI is force on\n");
+    }
+    clk_clr_force_on(MT_CG_DISP0_LARB2_SMI);
+
+	// For DSI PHY current leakage SW workaround.
+	///TODO: HOW!!!
+#if !defined (MTK_HDMI_SUPPORT)
+#ifndef MT65XX_NEW_DISP
+	if((lcm_params->type!=LCM_TYPE_DSI) && (lcm_params->type!=LCM_TYPE_DPI)){
+		DSI_PHY_clk_switch(TRUE);
+		DSI_PHY_clk_switch(FALSE);
+	}
+#endif
+#endif
+
+#ifndef MT65XX_NEW_DISP	
+    fbVA += DISP_GetFBRamSize();
+    fbPA += DISP_GetFBRamSize();
+#endif
+    r = (disp_drv->init) ?
+        (disp_drv->init(fbVA, fbPA, isLcmInited)) :
+        DISP_STATUS_NOT_IMPLEMENTED;
+
+#ifndef BUILD_UBOOT
+	DISP_InitVSYNC((100000000/lcd_fps) + 1);//us
+#endif
+
+    {
+        DAL_STATUS ret;
+        
+        /// DAL init here
+#ifndef MT65XX_NEW_DISP
+        fbVA += disp_drv->get_working_buffer_size();
+        fbPA += disp_drv->get_working_buffer_size();
+#else
+		fbVA += DISP_GetFBRamSize();
+		fbPA += DISP_GetFBRamSize();
+#endif
+        ret = DAL_Init(fbVA, fbPA);
+        ASSERT(DAL_STATUS_OK == ret);
+        dal_layerPA = fbPA;
+        dal_layerVA = fbVA;
+    }
+    		// check lcm status
+		if(lcm_drv->check_status)
+			lcm_drv->check_status();
+
+		memset((void*)(&dispif_info[MTKFB_DISPIF_PRIMARY_LCD]), 0, sizeof(mtk_dispif_info_t));
+		
+		switch(lcm_params->type)
+		{
+			case LCM_TYPE_DBI:
+			{
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayType = DISPIF_TYPE_DBI;
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayMode = DISPIF_MODE_COMMAND;
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].isHwVsyncAvailable = 1;
+				printk("DISP Info: DBI, CMD MOde, HY Vsync enable\n");
+				break;
+			}
+			case LCM_TYPE_DPI:
+			{
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayType = DISPIF_TYPE_DPI;
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayMode = DISPIF_MODE_VIDEO;
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].isHwVsyncAvailable = 1;				
+				printk("DISP Info: DPI, VDO MOde, HY Vsync enable\n");
+				break;
+			}
+			case LCM_TYPE_DSI:
+			{
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayType = DISPIF_TYPE_DSI;
+				if(lcm_params->dsi.mode == CMD_MODE)
+				{
+					dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayMode = DISPIF_MODE_COMMAND;
+					dispif_info[MTKFB_DISPIF_PRIMARY_LCD].isHwVsyncAvailable = 1;
+					printk("DISP Info: DSI, CMD MOde, HY Vsync enable\n");
+				}
+				else
+				{
+					dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayMode = DISPIF_MODE_VIDEO;
+					dispif_info[MTKFB_DISPIF_PRIMARY_LCD].isHwVsyncAvailable = 1;
+					printk("DISP Info: DSI, VDO MOde, HY Vsync enable\n");
+				}
+				
+				break;
+			}
+			default:
+				break;
+		}
+		
+
+	if(disp_drv->get_panel_color_format())
+	{
+		switch(disp_drv->get_panel_color_format())
+		{
+			case PANEL_COLOR_FORMAT_RGB565:
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayFormat = DISPIF_FORMAT_RGB565;
+			case PANEL_COLOR_FORMAT_RGB666:
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayFormat = DISPIF_FORMAT_RGB666;
+			case PANEL_COLOR_FORMAT_RGB888:
+				dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayFormat = DISPIF_FORMAT_RGB888;
+			default:
+				break;
+		}
+	}
+	
+	dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayWidth = DISP_GetScreenWidth();
+	dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayHeight = DISP_GetScreenHeight();
+	dispif_info[MTKFB_DISPIF_PRIMARY_LCD].vsyncFPS = lcd_fps;
+
+	if(dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayWidth * dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayHeight <= 240*432)
+	{
+		dispif_info[MTKFB_DISPIF_PRIMARY_LCD].xDPI = dispif_info[MTKFB_DISPIF_PRIMARY_LCD].yDPI = 120;
+	}
+	else if(dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayWidth * dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayHeight <= 320*480)
+	{
+		dispif_info[MTKFB_DISPIF_PRIMARY_LCD].xDPI = dispif_info[MTKFB_DISPIF_PRIMARY_LCD].yDPI = 160;
+	}
+	else if(dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayWidth * dispif_info[MTKFB_DISPIF_PRIMARY_LCD].displayHeight <= 480*854)
+	{
+		dispif_info[MTKFB_DISPIF_PRIMARY_LCD].xDPI = dispif_info[MTKFB_DISPIF_PRIMARY_LCD].yDPI = 240;
+	}
+	else
+	{
+		dispif_info[MTKFB_DISPIF_PRIMARY_LCD].xDPI = dispif_info[MTKFB_DISPIF_PRIMARY_LCD].yDPI = 320;
+	}
+	
+	dispif_info[MTKFB_DISPIF_PRIMARY_LCD].isConnected = 1;
+
+	
+
+    return r;
+}
+
+
+DISP_STATUS DISP_Deinit(void)
+{
+	DISP_CHECK_RET(DISP_PanelEnable(FALSE));
+	DISP_CHECK_RET(DISP_PowerEnable(FALSE));
+
+	return DISP_STATUS_OK;
+}
+
+// -----
+
+DISP_STATUS DISP_PowerEnable(BOOL enable)
+{
+	DISP_STATUS ret = DISP_STATUS_OK;
+
+#ifdef BUILD_UBOOT
+    static BOOL s_enabled = FALSE;
+#else
+	static BOOL s_enabled = TRUE;
+#endif
+
+	if (enable != s_enabled)
+		s_enabled = enable;
+	else
+		return ret;
+
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_PowerEnable()\n");
+		return DISP_STATUS_ERROR;
+	}
+
+	disp_drv_init_context();
+
+	is_engine_in_suspend_mode = enable ? FALSE : TRUE;
+
+    if (!is_ipoh_bootup)
+        needStartEngine = true;
+
+	ret = (disp_drv->enable_power) ?
+		(disp_drv->enable_power(enable)) :
+		DISP_STATUS_NOT_IMPLEMENTED;
+
+    if (enable) {
+        DAL_OnDispPowerOn();
+    }
+	
+	up(&sem_update_screen);
+
+
+	return ret;
+}
+
+
+DISP_STATUS DISP_PanelEnable(BOOL enable)
+{
+#ifdef BUILD_UBOOT
+    static BOOL s_enabled = FALSE;
+#else
+    static BOOL s_enabled = TRUE;
+#endif
+	DISP_STATUS ret = DISP_STATUS_OK;
+
+	DISP_LOG("panel is %s\n", enable?"enabled":"disabled");
+
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_PanelEnable()\n");
+		return DISP_STATUS_ERROR;
+	}
+
+	disp_drv_init_context();
+
+	is_lcm_in_suspend_mode = enable ? FALSE : TRUE;
+
+	if (is_ipoh_bootup)
+	    s_enabled = TRUE;
+
+	if (!lcm_drv->suspend || !lcm_drv->resume) {
+		ret = DISP_STATUS_NOT_IMPLEMENTED;
+		goto End;
+	}
+
+	if (enable && !s_enabled) {
+		s_enabled = TRUE;
+
+		if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		{		
+			DSI_SetMode(CMD_MODE);
+		}
+        mutex_lock(&LcmCmdMutex);
+		lcm_drv->resume();
+		
+		if(lcm_drv->check_status)
+			lcm_drv->check_status();
+		
+		DSI_LP_Reset();
+        mutex_unlock(&LcmCmdMutex);
+
+		if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		{
+			//DSI_clk_HS_mode(1);
+			DSI_WaitForNotBusy();
+			DSI_SetMode(lcm_params->dsi.mode);
+			
+			//DPI_CHECK_RET(DPI_EnableClk());
+			//DSI_CHECK_RET(DSI_EnableClk());
+
+			//msleep(200);
+		}
+	}
+	else if (!enable && s_enabled)
+	{
+		LCD_CHECK_RET(LCD_WaitForNotBusy());
+		if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode == CMD_MODE)
+			DSI_CHECK_RET(DSI_WaitForNotBusy());
+		s_enabled = FALSE;
+
+		if (lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		{		
+			DPI_CHECK_RET(DPI_DisableClk());
+			//msleep(200);
+			DSI_Reset();
+			DSI_clk_HS_mode(0);
+			DSI_SetMode(CMD_MODE);
+		}
+
+        mutex_lock(&LcmCmdMutex);
+		lcm_drv->suspend();
+        mutex_unlock(&LcmCmdMutex);
+	}
+
+End:
+	up(&sem_update_screen);
+
+	return ret;
+}
+
+DISP_STATUS DISP_LCDPowerEnable(BOOL enable)
+{
+	if (enable)
+    {
+        LCD_CHECK_RET(LCD_PowerOn());
+        #if defined(MTK_M4U_SUPPORT)
+        LCD_CHECK_RET(LCD_M4UPowerOn());
+        #endif
+    }
+    else
+    {
+        LCD_CHECK_RET(LCD_PowerOff());
+        #if defined(MTK_M4U_SUPPORT)
+        LCD_CHECK_RET(LCD_M4UPowerOff());
+        #endif
+    }
+
+	return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_SetBacklight(UINT32 level)
+{
+	DISP_STATUS ret = DISP_STATUS_OK;
+
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_SetBacklight()\n");
+		return DISP_STATUS_ERROR;
+	}
+
+	disp_drv_init_context();
+
+	LCD_WaitForNotBusy();
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode == CMD_MODE)
+		DSI_CHECK_RET(DSI_WaitForNotBusy());
+
+	if (!lcm_drv->set_backlight) {
+		ret = DISP_STATUS_NOT_IMPLEMENTED;
+		goto End;
+	}
+
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		DSI_SetMode(CMD_MODE);
+
+    mutex_lock(&LcmCmdMutex);
+	lcm_drv->set_backlight(level);
+	DSI_LP_Reset();
+    mutex_unlock(&LcmCmdMutex);
+
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		DSI_SetMode(lcm_params->dsi.mode);
+
+End:
+
+	up(&sem_update_screen);
+
+	return ret;
+}
+
+DISP_STATUS DISP_SetBacklight_mode(UINT32 mode)
+{
+	DISP_STATUS ret = DISP_STATUS_OK;
+
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_SetBacklight_mode()\n");
+		return DISP_STATUS_ERROR;
+	}
+
+	disp_drv_init_context();
+
+	LCD_WaitForNotBusy();
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode == CMD_MODE)
+		DSI_CHECK_RET(DSI_WaitForNotBusy());
+
+	if (!lcm_drv->set_backlight) {
+		ret = DISP_STATUS_NOT_IMPLEMENTED;
+		goto End;
+	}
+
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		DSI_SetMode(CMD_MODE);
+
+    mutex_lock(&LcmCmdMutex);
+	lcm_drv->set_backlight_mode(mode);
+	DSI_LP_Reset();
+    mutex_unlock(&LcmCmdMutex);
+
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+		DSI_SetMode(lcm_params->dsi.mode);
+
+End:
+
+	up(&sem_update_screen);
+
+	return ret;
+
+}
+
+DISP_STATUS DISP_SetPWM(UINT32 divider)
+{
+	DISP_STATUS ret = DISP_STATUS_OK;
+
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_SetPWM()\n");
+		return DISP_STATUS_ERROR;
+	}
+
+	disp_drv_init_context();
+
+	LCD_WaitForNotBusy();
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode == CMD_MODE)
+		DSI_CHECK_RET(DSI_WaitForNotBusy());
+
+	if (!lcm_drv->set_pwm) {
+		ret = DISP_STATUS_NOT_IMPLEMENTED;
+		goto End;
+	}
+
+    mutex_lock(&LcmCmdMutex);
+	lcm_drv->set_pwm(divider);
+	DSI_LP_Reset();
+    mutex_unlock(&LcmCmdMutex);
+End:
+
+	up(&sem_update_screen);
+
+	return ret;
+}
+
+DISP_STATUS DISP_GetPWM(UINT32 divider, unsigned int *freq)
+{
+	DISP_STATUS ret = DISP_STATUS_OK;
+	
+	disp_drv_init_context();
+
+	if (!lcm_drv->get_pwm) {
+		ret = DISP_STATUS_NOT_IMPLEMENTED;
+		goto End;
+	}
+
+    mutex_lock(&LcmCmdMutex);
+	*freq = lcm_drv->get_pwm(divider);
+    mutex_unlock(&LcmCmdMutex);
+
+End:
+	return ret;
+}
+
+#ifndef BUILD_UBOOT
+#if defined(MTK_LCD_HW_3D_SUPPORT)
+static BOOL is3denabled = FALSE;
+static BOOL ispwmenabled = FALSE;
+static BOOL ismodechanged = FALSE;
+
+static BOOL gCurrentMode = FALSE;
+static BOOL gUsingMode = FALSE;
+
+
+DISP_STATUS DISP_Set3DPWM(BOOL enable, BOOL landscape)
+{
+#if 1
+	unsigned int temp_reg;
+
+	if (enable && (!ispwmenabled || ismodechanged))
+	{
+		struct  pwm_easy_config pwm_setting;
+		// Set GPIO66, GPIO67, GPIO68 to PWM2, PWM1, PWM3
+		mt_set_gpio_mode(GPIO187, GPIO_MODE_GPIO);	
+		mt_set_gpio_out(GPIO187, GPIO_OUT_ONE);
+		
+		mt_set_gpio_mode(GPIO66, GPIO_MODE_07);	
+		mt_set_gpio_mode(GPIO67, GPIO_MODE_07);	
+		mt_set_gpio_mode(GPIO68, GPIO_MODE_07);	
+
+		pwm_setting.clk_src = PWM_CLK_OLD_MODE_32K;
+		pwm_setting.duty = 50;
+		pwm_setting.clk_div = CLK_DIV1;
+		pwm_setting.duration = 533;
+
+		pwm_setting.pwm_no = PWM1;
+		pwm_set_easy_config(&pwm_setting);
+		pwm_setting.pwm_no = PWM2;
+		pwm_set_easy_config(&pwm_setting);
+		pwm_setting.pwm_no = PWM3;
+		pwm_set_easy_config(&pwm_setting);
+
+		temp_reg=INREG32(INFRA_SYS_CFG_BASE+0x700); 
+
+		temp_reg&=~0xF000000;
+
+		if(landscape)
+			temp_reg|=0x9000000;
+		else
+			temp_reg|=0x3000000;
+
+		OUTREG32((INFRA_SYS_CFG_BASE+0x700), temp_reg);
+
+		ispwmenabled = TRUE;
+		
+		DISP_LOG("3D PWM is enabled. landscape:%d ! \n", landscape);
+	}
+	else if (!enable && ispwmenabled)
+	{	
+		mt_set_gpio_mode(GPIO187, GPIO_MODE_GPIO);	
+		mt_set_gpio_out(GPIO187, GPIO_OUT_ZERO);
+
+		mt_set_gpio_mode(GPIO66, GPIO_MODE_GPIO);	
+		mt_set_gpio_mode(GPIO67, GPIO_MODE_GPIO);	
+		mt_set_gpio_mode(GPIO68, GPIO_MODE_GPIO);	
+
+		ispwmenabled = FALSE;
+
+		DISP_LOG("3D PWM is disabled ! \n");
+	}
+#endif
+	return DISP_STATUS_OK;
+}
+
+
+BOOL DISP_Is3DEnabled(void)
+{
+	is3denabled = LCD_Is3DEnabled();
+
+	return is3denabled;
+}
+
+BOOL DISP_is3DLandscapeMode(void)
+{
+	gCurrentMode = LCD_Is3DLandscapeMode();
+
+	if (gCurrentMode != gUsingMode)
+		ismodechanged = TRUE;
+	else
+		ismodechanged = FALSE;
+	
+	gUsingMode = gCurrentMode;
+
+	return LCD_Is3DLandscapeMode();
+}
+#endif
+#endif
+
+// -----
+
+DISP_STATUS DISP_SetFrameBufferAddr(UINT32 fbPhysAddr)
+{
+	LCD_CHECK_RET(LCD_LayerSetAddress(FB_LAYER, fbPhysAddr));
+
+    return DISP_STATUS_OK;
+}
+
+// -----
+
+static BOOL is_overlaying = FALSE;
+
+DISP_STATUS DISP_EnterOverlayMode(void)
+{
+	DISP_FUNC();
+	if (is_overlaying) {
+		return DISP_STATUS_ALREADY_SET;
+	} else {
+		is_overlaying = TRUE;
+	}
+
+	return DISP_STATUS_OK;
+}
+
+
+DISP_STATUS DISP_LeaveOverlayMode(void)
+{
+	DISP_FUNC();
+	if (!is_overlaying) {
+		return DISP_STATUS_ALREADY_SET;
+	} else {
+		is_overlaying = FALSE;
+	}
+
+	return DISP_STATUS_OK;
+}
+
+
+// -----
+
+DISP_STATUS DISP_EnableDirectLinkMode(UINT32 layer)
+{
+    ///since MT6573 we do not support DC mode
+	return DISP_STATUS_OK;
+}
+
+
+DISP_STATUS DISP_DisableDirectLinkMode(UINT32 layer)
+{
+    ///since MT6573 we do not support DC mode
+	return DISP_STATUS_OK;
+}
+
+// -----
+
+extern int MT6516IDP_EnableDirectLink(void);
+
+DISP_STATUS DISP_UpdateScreen(UINT32 x, UINT32 y, UINT32 width, UINT32 height)
+{
+    unsigned int is_video_mode;
+	DISP_LOG("update screen, (%d,%d),(%d,%d)\n", x, y, width, height);
+	if ((lcm_params->type==LCM_TYPE_DPI) ||
+	    ((lcm_params->type==LCM_TYPE_DSI) && (lcm_params->dsi.mode != CMD_MODE)))
+	    is_video_mode = 1;
+	else
+	    is_video_mode = 0;
+	if (down_interruptible(&sem_update_screen)) {
+		printk("ERROR: Can't get sem_update_screen in DISP_UpdateScreen()\n");
+		return DISP_STATUS_ERROR;
+	}
+#ifndef BUILD_UBOOT
+#if defined(MTK_LCD_HW_3D_SUPPORT)
+	LCD_CHECK_RET(DISP_Set3DPWM( DISP_Is3DEnabled(), DISP_is3DLandscapeMode() ));
+#endif
+#endif
+	// if LCM is powered down, LCD would never recieve the TE signal
+	//
+	if (is_lcm_in_suspend_mode || is_engine_in_suspend_mode) goto End;
+#ifndef MT65XX_NEW_DISP
+	LCD_CHECK_RET(LCD_WaitForNotBusy());
+	if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode == CMD_MODE)
+		DSI_CHECK_RET(DSI_WaitForNotBusy());
+#endif
+    if (is_video_mode && is_video_mode_running)
+        needStartEngine = false;
+    if (needStartEngine)
+    {
+	    if (lcm_drv->update) {
+            mutex_lock(&LcmCmdMutex);
+		    lcm_drv->update(x, y, width, height);
+			DSI_LP_Reset();
+            mutex_unlock(&LcmCmdMutex);
+        }
+    }
+#ifndef MT65XX_NEW_DISP
+    LCD_CHECK_RET(LCD_SetRoiWindow(x, y, width, height));
+
+	LCD_CHECK_RET(LCD_FBSetStartCoord(x, y));
+#endif
+	if (-1 != direct_link_layer) {
+		//MT6516IDP_EnableDirectLink();     // FIXME
+	} 
+    else 
+    {
+        if (needStartEngine)
+		    disp_drv->update_screen(FALSE);
+	}
+    needStartEngine = false;
+End:
+	up(&sem_update_screen);
+
+	return DISP_STATUS_OK;
+}
+
+static DISP_INTERRUPT_CALLBACK_STRUCT DISP_CallbackArray[DISP_LCD_INTERRUPT_EVENTS_NUMBER + DISP_DSI_INTERRUPT_EVENTS_NUMBER + DISP_DPI_INTERRUPT_EVENTS_NUMBER];
+
+static void _DISP_InterruptCallbackProxy(DISP_INTERRUPT_EVENTS eventID)
+{
+    UINT32 offset;
+
+    if(eventID >= DISP_LCD_INTERRUPT_EVENTS_START && eventID <= DISP_LCD_INTERRUPT_EVENTS_END )
+    {
+        offset = eventID - DISP_LCD_INTERRUPT_EVENTS_START;
+        if(DISP_CallbackArray[offset].pFunc)
+        {
+            DISP_CallbackArray[offset].pFunc(DISP_CallbackArray[offset].pParam);
+        }
+    }
+    else if(eventID >= DISP_DSI_INTERRUPT_EVENTS_START && eventID <= DISP_DSI_INTERRUPT_EVENTS_END )
+    {
+        offset = eventID - DISP_DSI_INTERRUPT_EVENTS_START + DISP_LCD_INTERRUPT_EVENTS_NUMBER;
+        if(DISP_CallbackArray[offset].pFunc)
+        {
+            DISP_CallbackArray[offset].pFunc(DISP_CallbackArray[offset].pParam);
+        }
+    }
+    else if(eventID >= DISP_DPI_INTERRUPT_EVENTS_START && eventID <= DISP_DPI_INTERRUPT_EVENTS_END )
+    {
+        offset = eventID - DISP_DPI_INTERRUPT_EVENTS_START + DISP_LCD_INTERRUPT_EVENTS_NUMBER + DISP_DSI_INTERRUPT_EVENTS_NUMBER;
+        if(DISP_CallbackArray[offset].pFunc)
+        {
+            DISP_CallbackArray[offset].pFunc(DISP_CallbackArray[offset].pParam);
+        }
+    }
+    else
+    {
+        DISP_LOG("Invalid event id: %d\n", eventID);
+        ASSERT(0);
+    }
+
+    return;
+}
+
+DISP_STATUS DISP_SetInterruptCallback(DISP_INTERRUPT_EVENTS eventID, DISP_INTERRUPT_CALLBACK_STRUCT *pCBStruct)
+{
+    UINT32 offset;
+    ASSERT(pCBStruct != NULL);
+    
+	disp_drv_init_context();
+
+    if(eventID >= DISP_LCD_INTERRUPT_EVENTS_START && eventID <= DISP_LCD_INTERRUPT_EVENTS_END )
+    {
+        ///register callback
+        offset = eventID - DISP_LCD_INTERRUPT_EVENTS_START;
+        DISP_CallbackArray[offset].pFunc = pCBStruct->pFunc;
+        DISP_CallbackArray[offset].pParam = pCBStruct->pParam;
+        
+        LCD_CHECK_RET(LCD_SetInterruptCallback(_DISP_InterruptCallbackProxy));
+        LCD_CHECK_RET(LCD_EnableInterrupt(eventID));
+    }
+    else if(eventID >= DISP_DSI_INTERRUPT_EVENTS_START && eventID <= DISP_DSI_INTERRUPT_EVENTS_END )
+    {
+        ///register callback
+        offset = eventID - DISP_DSI_INTERRUPT_EVENTS_START + DISP_LCD_INTERRUPT_EVENTS_NUMBER;
+        DISP_CallbackArray[offset].pFunc = pCBStruct->pFunc;
+        DISP_CallbackArray[offset].pParam = pCBStruct->pParam;
+
+        DSI_CHECK_RET(DSI_SetInterruptCallback(_DISP_InterruptCallbackProxy));
+        DSI_CHECK_RET(DSI_EnableInterrupt(eventID));
+    }
+    else if(eventID >= DISP_DPI_INTERRUPT_EVENTS_START && eventID <= DISP_DPI_INTERRUPT_EVENTS_END )
+    {
+        offset = eventID - DISP_DPI_INTERRUPT_EVENTS_START + DISP_LCD_INTERRUPT_EVENTS_NUMBER + DISP_DSI_INTERRUPT_EVENTS_NUMBER;
+        DISP_CallbackArray[offset].pFunc = pCBStruct->pFunc;
+        DISP_CallbackArray[offset].pParam = pCBStruct->pParam;
+    
+        DPI_CHECK_RET(DPI_SetInterruptCallback(_DISP_InterruptCallbackProxy));
+        DPI_CHECK_RET(DPI_EnableInterrupt(eventID));
+    }
+    else
+    {
+        DISP_LOG("Invalid event id: %d\n", eventID);
+        ASSERT(0);
+        return DISP_STATUS_ERROR;        ///TODO: error log
+    }
+    return DISP_STATUS_OK;
+}
+
+
+DISP_STATUS DISP_WaitForLCDNotBusy(void)
+{
+    LCD_WaitForNotBusy();
+    return DISP_STATUS_OK;
+}
+
+#ifdef MT65XX_NEW_DISP
+
+DISP_STATUS _DISP_ConfigUpdateScreen(UINT32 x, UINT32 y, UINT32 width, UINT32 height)
+{
+#if defined(MTK_LCD_HW_3D_SUPPORT)
+    LCD_CHECK_RET(DISP_Set3DPWM( DISP_Is3DEnabled(), DISP_is3DLandscapeMode() ));
+#endif
+    // if LCM is powered down, LCD would never recieve the TE signal
+    //
+    if (is_lcm_in_suspend_mode || is_engine_in_suspend_mode) return DISP_STATUS_ERROR;
+    if (lcm_drv->update) {
+        mutex_lock(&LcmCmdMutex);
+        lcm_drv->update(x, y, width, height);
+		DSI_LP_Reset();
+        mutex_unlock(&LcmCmdMutex);
+    }
+    disp_drv->update_screen(TRUE);
+
+    return DISP_STATUS_OK;
+}
+
+#define DISP_CB_MAXCNT 2
+typedef struct {
+    DISP_EXTRA_CHECKUPDATE_PTR checkupdate_cb[DISP_CB_MAXCNT];
+    DISP_EXTRA_CONFIG_PTR config_cb[DISP_CB_MAXCNT];
+} CONFIG_CB_ARRAY;
+CONFIG_CB_ARRAY g_CB_Array = { {NULL , NULL},{NULL , NULL}};//if DISP_CB_MAXCNT == 2
+DEFINE_MUTEX(UpdateRegMutex);
+void GetUpdateMutex(void)
+{
+    mutex_lock(&UpdateRegMutex);
+}
+int TryGetUpdateMutex(void)
+{
+    return mutex_trylock(&UpdateRegMutex);
+}
+void ReleaseUpdateMutex(void)
+{
+    mutex_unlock(&UpdateRegMutex);
+}
+
+int DISP_RegisterExTriggerSource(DISP_EXTRA_CHECKUPDATE_PTR pCheckUpdateFunc , DISP_EXTRA_CONFIG_PTR pConfFunc)
+{
+    int index = 0;
+    int hit = 0;
+    if((NULL == pCheckUpdateFunc) || (NULL == pConfFunc))
+    {
+        printk("Warnning! [Func]%s register NULL function : %p,%p\n", __func__ , pCheckUpdateFunc , pConfFunc);
+        return -1;
+    }
+
+    GetUpdateMutex();
+
+    for(index = 0 ; index < DISP_CB_MAXCNT ; index += 1)
+    {
+        if(NULL == g_CB_Array.checkupdate_cb[index])
+        {
+            g_CB_Array.checkupdate_cb[index] = pCheckUpdateFunc;
+            g_CB_Array.config_cb[index] = pConfFunc;
+            hit = 1;
+            break;
+        }
+    }
+
+    ReleaseUpdateMutex();
+
+    return (hit ? index : (-1));
+}
+
+void DISP_UnRegisterExTriggerSource(int u4ID)
+{
+    if(DISP_CB_MAXCNT < (u4ID+1))
+    {
+        printk("Warnning! [Func]%s unregister a never registered function : %d\n", __func__ , u4ID);
+        return;
+    }
+
+    GetUpdateMutex();
+
+    g_CB_Array.checkupdate_cb[u4ID] = NULL;
+    g_CB_Array.config_cb[u4ID] = NULL;
+
+    ReleaseUpdateMutex();
+}
+#if defined (MTK_HDMI_SUPPORT)
+extern 	bool is_hdmi_active(void);
+#endif
+#if defined (MTK_WFD_SUPPORT)
+extern 	bool is_wfd_active(void);
+extern unsigned int wfd_get_current_ovl_dst_addr(void);
+static int debug_ovl_dst_addr = 0;
+#endif
+
+
+static int _DISP_CaptureFBKThread(void *data)
+{
+	struct fb_info* pInfo = (struct fb_info*) data;
+	MMP_MetaDataBitmap_t Bitmap;
+    while(1)
+    {
+		wait_event_interruptible(gCaptureFBWQ, gCaptureFBEnable);
+		Bitmap.data1 = pInfo->var.yoffset;
+		Bitmap.width = DISP_GetScreenWidth();
+		Bitmap.height = DISP_GetScreenHeight() * 2;
+		Bitmap.bpp = pInfo->var.bits_per_pixel;
+		switch (pInfo->var.bits_per_pixel)
+		{
+		case 16:
+		    Bitmap.format = MMProfileBitmapRGB565;
+		    break;
+		case 32:
+		    Bitmap.format = MMProfileBitmapBGRA8888;
+		    break;
+		default:
+		    Bitmap.format = MMProfileBitmapRGB565;
+		    Bitmap.bpp = 16;
+		    break;
+		}
+		Bitmap.start_pos = 0;
+		Bitmap.pitch = pInfo->fix.line_length;
+		if (Bitmap.pitch == 0)
+		{
+		    Bitmap.pitch = ALIGN_TO(Bitmap.width, 32) * Bitmap.bpp / 8;
+		}
+		Bitmap.data_size = Bitmap.pitch * Bitmap.height;
+		Bitmap.down_sample_x = gCaptureFBDownX;
+		Bitmap.down_sample_y = gCaptureFBDownY;
+		Bitmap.pData = ((struct mtkfb_device*)pInfo->par)->fb_va_base;
+		MMProfileLogMetaBitmap(MTKFB_MMP_Events.FBDump, MMProfileFlagPulse, &Bitmap);
+        msleep(gCaptureFBPeriod);
+    }
+    return 0;
+}
+
+static int _DISP_CaptureOvlKThread(void *data)
+{
+	unsigned int index = 0;
+	unsigned int mva[2];
+	void* va[2];
+	unsigned int buf_size;
+	M4U_PORT_STRUCT portStruct;
+	unsigned int init = 0;
+	unsigned int enabled = 0;
+       MMP_MetaDataBitmap_t Bitmap;
+    buf_size = DISP_GetScreenWidth() * DISP_GetScreenHeight() * 4;
+
+    while(1)
+    {
+        wait_event_interruptible(reg_update_wq, gWakeupCaptureOvlThread);
+        gWakeupCaptureOvlThread = 0;
+        if (init == 0)
+        {
+			va[0] = vmalloc(buf_size);
+			va[1] = vmalloc(buf_size);
+			memset(va[0], 0, buf_size);
+			memset(va[1], 0, buf_size);
+			m4u_alloc_mva(M4U_CLNTMOD_WDMA, (unsigned int)va[0], buf_size, 0, 0, &(mva[0]));
+			m4u_alloc_mva(M4U_CLNTMOD_WDMA, (unsigned int)va[1], buf_size, 0, 0, &(mva[1]));
+            disp_module_clock_on(DISP_MODULE_WDMA1, "Dump OVL");
+			portStruct.ePortID = M4U_PORT_WDMA1;		   //hardware port ID, defined in M4U_PORT_ID_ENUM
+			portStruct.Virtuality = 1;
+			portStruct.Security = 0;
+			portStruct.domain = 0;			  //domain : 0 1 2 3
+			portStruct.Distance = 1;
+			portStruct.Direction = 0;
+			m4u_config_port(&portStruct);
+			init = 1;
+        }
+        if (!gCaptureOvlThreadEnable)
+        {
+            if (enabled)
+            {
+                DISP_Config_Overlay_to_Memory(mva[index], 0);
+                enabled = 0;
+            }
+            continue;
+        }
+		DISP_Config_Overlay_to_Memory(mva[index], 1);
+        enabled = 1;
+
+		m4u_dma_cache_maint(M4U_CLNTMOD_WDMA,
+			va[index],
+			DISP_GetScreenHeight()*DISP_GetScreenWidth()*24/8,
+			DMA_BIDIRECTIONAL);
+
+		Bitmap.data1 = index;
+		Bitmap.data2 = mva[index];
+		Bitmap.width = DISP_GetScreenWidth();
+		Bitmap.height = DISP_GetScreenHeight();
+		Bitmap.format = MMProfileBitmapBGR888;
+		Bitmap.start_pos = 0;
+		Bitmap.bpp = 24;
+		Bitmap.pitch = DISP_GetScreenWidth()*3;
+		Bitmap.data_size = Bitmap.pitch * Bitmap.height;
+		Bitmap.down_sample_x = gCaptureOvlDownX;
+		Bitmap.down_sample_y = gCaptureOvlDownY;
+		Bitmap.pData = va[index];
+		MMProfileLogMetaBitmap(MTKFB_MMP_Events.OvlDump, MMProfileFlagPulse, &Bitmap);
+		index = 1 - index;
+    }
+    return 0;
+}
+
+static void _DISP_DumpLayer(OVL_CONFIG_STRUCT* pLayer)
+{
+    if (gCaptureLayerEnable && pLayer->layer_en)
+    {
+        MMP_MetaDataBitmap_t Bitmap;
+        Bitmap.data1 = pLayer->vaddr;
+        Bitmap.width = pLayer->dst_w;
+        Bitmap.height = pLayer->dst_h;
+        switch (pLayer->fmt)
+        {
+        case OVL_INPUT_FORMAT_RGB565: Bitmap.format = MMProfileBitmapRGB565; Bitmap.bpp = 16; break;
+        case OVL_INPUT_FORMAT_RGB888: Bitmap.format = MMProfileBitmapBGR888; Bitmap.bpp = 24; break;
+        case OVL_INPUT_FORMAT_ARGB8888:
+        case OVL_INPUT_FORMAT_PARGB8888:
+        case OVL_INPUT_FORMAT_xRGB8888: Bitmap.format = MMProfileBitmapBGRA8888; Bitmap.bpp = 32; break;
+        case OVL_INPUT_FORMAT_BGR888: Bitmap.format = MMProfileBitmapRGB888; Bitmap.bpp = 24; break;
+        case OVL_INPUT_FORMAT_ABGR8888:
+        case OVL_INPUT_FORMAT_PABGR8888:
+        case OVL_INPUT_FORMAT_xBGR8888: Bitmap.format = MMProfileBitmapRGBA8888; Bitmap.bpp = 32; break;
+        default: return;
+        }
+        Bitmap.start_pos = 0;
+        Bitmap.pitch = pLayer->src_pitch;
+        Bitmap.data_size = Bitmap.pitch * Bitmap.height;
+        Bitmap.down_sample_x = gCaptureLayerDownX;
+        Bitmap.down_sample_y = gCaptureLayerDownY;
+        if (pLayer->addr >= fb_pa &&
+            pLayer->addr < (fb_pa+DISP_GetVRamSize()))
+        {
+            Bitmap.pData = pLayer->vaddr;
+            MMProfileLogMetaBitmap(MTKFB_MMP_Events.Layer[pLayer->layer], MMProfileFlagPulse, &Bitmap);
+        }
+        else
+        {
+            m4u_mva_map_kernel(pLayer->addr, Bitmap.data_size, 0, (unsigned int*)&Bitmap.pData, &Bitmap.data_size);
+            MMProfileLogMetaBitmap(MTKFB_MMP_Events.Layer[pLayer->layer], MMProfileFlagPulse, &Bitmap);
+            m4u_mva_unmap_kernel(pLayer->addr, Bitmap.data_size, (unsigned int)Bitmap.pData);
+        }
+    }
+}
+
+static void _DISP_VSyncCallback(void* pParam);
+
+void DISP_StartConfigUpdate(void)
+{
+	if(((LCM_TYPE_DSI == lcm_params->type) && (CMD_MODE == lcm_params->dsi.mode)) || (LCM_TYPE_DBI == lcm_params->type))
+	{
+		config_update_task_wakeup = 1;
+		wake_up_interruptible(&config_update_wq);
+	}
+}
+
+static int _DISP_ConfigUpdateKThread(void *data)
+{
+    int i;
+    int dirty = 0;
+    int overlay_dirty = 0;
+    int aal_dirty = 0;
+    int index = 0;
+    unsigned int esd_check_count;
+    struct disp_path_config_mem_out_struct mem_out_config;
+    struct sched_param param = { .sched_priority = RTPM_PRIO_SCRN_UPDATE };
+    sched_setscheduler(current, SCHED_RR, &param);
+    while(1)
+    {
+        wait_event_interruptible(config_update_wq, config_update_task_wakeup);
+        config_update_task_wakeup = 0;
+        //MMProfileLog(MTKFB_MMP_Events.UpdateConfig, MMProfileFlagStart);
+        dirty = 0;
+
+        if (down_interruptible(&sem_early_suspend)) {
+            printk("[FB Driver] can't get semaphore in mtkfb_early_suspend()\n");
+            continue;
+        }
+        //MMProfileLogEx(MTKFB_MMP_Events.EarlySuspend, MMProfileFlagStart, 1, 0);
+        if (need_esd_check && (!is_early_suspended))
+        {
+            esd_check_count = 0;
+            disp_running = 1;
+            MMProfileLog(MTKFB_MMP_Events.EsdCheck, MMProfileFlagStart);
+            while (esd_check_count < LCM_ESD_CHECK_MAX_COUNT)
+            {
+				if(DISP_EsdCheck())
+				{
+					MMProfileLogEx(MTKFB_MMP_Events.EsdCheck, MMProfileFlagPulse, 0, 0);
+					DISP_EsdRecover();
+				}
+				else
+				{
+				    break;
+				}
+				esd_check_count++;
+            }
+            if (esd_check_count >= LCM_ESD_CHECK_MAX_COUNT)
+            {
+				MMProfileLogEx(MTKFB_MMP_Events.EsdCheck, MMProfileFlagPulse, 2, 0);
+				esd_kthread_pause = TRUE;
+            }
+            if (esd_check_count)
+            {
+				if (lcm_drv->update)
+				{
+					mutex_lock(&LcmCmdMutex);
+					lcm_drv->update(0, 0, DISP_GetScreenWidth(), DISP_GetScreenHeight());
+					mutex_unlock(&LcmCmdMutex);
+				}
+				dirty = 1;
+            }
+            need_esd_check = 0;
+            wake_up_interruptible(&esd_check_wq);
+            MMProfileLog(MTKFB_MMP_Events.EsdCheck, MMProfileFlagEnd);
+            // Do not set disp_running to 0 for DSI video mode.
+            if ((lcm_params->type == LCM_TYPE_DSI) && (lcm_params->dsi.mode != CMD_MODE))
+                disp_running = 1;
+            else
+            disp_running = 0;
+        }
+
+        if (!is_early_suspended)
+        {
+            if (mutex_trylock(&OverlaySettingMutex))
+            {
+                overlay_dirty = atomic_read(&OverlaySettingDirtyFlag);
+                if (overlay_dirty)
+                {
+                    layer_config_index = 1 - layer_config_index;
+                    captured_layer_config = _layer_config[layer_config_index];
+                    memcpy(captured_layer_config, cached_layer_config, sizeof(OVL_CONFIG_STRUCT)*DDP_OVL_LAYER_MUN);
+                    for (i=0; i<DDP_OVL_LAYER_MUN; i++)
+                        cached_layer_config[i].isDirty = false;
+                    MMProfileLogStructure(MTKFB_MMP_Events.ConfigOVL, MMProfileFlagPulse, captured_layer_config, struct DBG_OVL_CONFIGS);
+                    atomic_set(&OverlaySettingDirtyFlag, 0);
+                    PanDispSettingDirty = 0;
+                    dirty = 1;
+                }
+                mutex_unlock(&OverlaySettingMutex);
+            }
+            aal_dirty = overlay_dirty;//overlay refresh means AAL also needs refresh
+            //GetUpdateMutex();
+            if(1 == TryGetUpdateMutex())
+            {
+                for(index = 0 ; index < DISP_CB_MAXCNT ; index += 1)
+                {
+                    if((NULL != g_CB_Array.checkupdate_cb[index]) && g_CB_Array.checkupdate_cb[index](overlay_dirty))
+                    {
+                        dirty = 1;
+                        aal_dirty = 1;
+                        break;
+                    }
+                }
+                ReleaseUpdateMutex();
+            }
+
+            if (mutex_trylock(&MemOutSettingMutex))
+            {
+                if (MemOutConfig.dirty)
+                {
+                    memcpy(&mem_out_config, &MemOutConfig, sizeof(MemOutConfig));
+                    MemOutConfig.dirty = 0;
+                    dirty = 1;
+                }
+                else
+                    mem_out_config.dirty = 0;
+                mutex_unlock(&MemOutSettingMutex);
+            }
+        }
+		if(((LCM_TYPE_DSI == lcm_params->type) && (CMD_MODE == lcm_params->dsi.mode)) || (LCM_TYPE_DBI == lcm_params->type))
+		{
+			_DISP_VSyncCallback(NULL);
+		}
+
+        if (dirty)
+        {
+            // Apply configuration here.
+            disp_running = 1;
+            disp_path_get_mutex();
+            if (overlay_dirty)
+            {
+                MMProfileLog(MTKFB_MMP_Events.ConfigOVL, MMProfileFlagStart);
+                for (i=0; i<DDP_OVL_LAYER_MUN; i++)
+                {
+                    if (captured_layer_config[i].isDirty)
+                    {
+                        _DISP_DumpLayer(&captured_layer_config[i]);
+                        disp_path_config_layer(&captured_layer_config[i]);
+                    }
+                }
+                if ((lcm_params->type == LCM_TYPE_DBI) ||
+                    ((lcm_params->type == LCM_TYPE_DSI) && (lcm_params->dsi.mode == CMD_MODE)))
+                {
+                    if ((PanDispSettingPending==1) && (PanDispSettingDirty==0))
+                    {
+                        PanDispSettingApplied = 1;
+                        PanDispSettingPending = 0;
+                    }
+                    atomic_set(&OverlaySettingApplied, 1);
+                    wake_up_interruptible(&reg_update_wq);
+                }
+                MMProfileLog(MTKFB_MMP_Events.ConfigOVL, MMProfileFlagEnd);
+
+
+            }
+
+            // Apply AAL config here.
+            if (aal_dirty)
+            {
+                MMProfileLog(MTKFB_MMP_Events.ConfigAAL, MMProfileFlagStart);
+
+                //GetUpdateMutex();
+                if(1 == TryGetUpdateMutex())
+                {
+                    for(index = 0 ; index < DISP_CB_MAXCNT ; index += 1)
+                    {
+                        if((NULL != g_CB_Array.checkupdate_cb[index]) && g_CB_Array.checkupdate_cb[index](overlay_dirty))
+                        {
+                            g_CB_Array.config_cb[index](overlay_dirty);
+                        }
+                    }
+                    ReleaseUpdateMutex();
+                }
+                MMProfileLog(MTKFB_MMP_Events.ConfigAAL, MMProfileFlagEnd);
+            }
+
+            // Apply memory out config here.
+            if (mem_out_config.dirty)
+            {
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagStart, mem_out_config.enable, mem_out_config.dstAddr);
+                disp_path_config_mem_out(&mem_out_config);
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagEnd, 0, 0);
+            }
+#if defined(MTK_HDMI_SUPPORT)
+                if(is_hdmi_active() && !DISP_IsVideoMode())
+                {
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagStart, mem_out_config.enable, mem_out_config.dstAddr);
+                    memcpy(&mem_out_config, &MemOutConfig, sizeof(MemOutConfig));
+                    disp_path_config_mem_out(&mem_out_config);
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagEnd, 1, 0);
+                }
+#endif
+#if defined(MTK_WFD_SUPPORT)
+            if(is_wfd_active() && !DISP_IsVideoMode())
+            {
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagStart, mem_out_config.enable, mem_out_config.dstAddr);
+                memcpy(&mem_out_config, &MemOutConfig, sizeof(MemOutConfig));
+
+				mem_out_config.dstAddr = wfd_get_current_ovl_dst_addr();
+				if(debug_ovl_dst_addr == mem_out_config.dstAddr)
+					MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagPulse, 0xFFFFFFFF,0xFFFFFFFF);
+			
+				debug_ovl_dst_addr = wfd_get_current_ovl_dst_addr();					
+                disp_path_config_mem_out(&mem_out_config);
+                MMProfileLogEx(MTKFB_MMP_Events.ConfigMemOut, MMProfileFlagEnd, 2, 0);
+            }
+#endif
+            // Trigger interface engine for cmd mode.
+            if ((lcm_params->type == LCM_TYPE_DBI) ||
+                ((lcm_params->type == LCM_TYPE_DSI) && (lcm_params->dsi.mode == CMD_MODE)))
+            {
+                DISP_STATUS ret = _DISP_ConfigUpdateScreen(0, 0, DISP_GetScreenWidth(), DISP_GetScreenHeight());
+                if ((ret != DISP_STATUS_OK) && (is_early_suspended == 0))
+                    hrtimer_start(&cmd_mode_update_timer, cmd_mode_update_timer_period, HRTIMER_MODE_REL);
+            }
+            disp_path_release_mutex();
+        }
+        else
+        {
+            if ((lcm_params->type == LCM_TYPE_DBI) ||
+                ((lcm_params->type == LCM_TYPE_DSI) && (lcm_params->dsi.mode == CMD_MODE)))
+            {
+                // Start update timer.
+                if (!is_early_suspended)
+                    hrtimer_start(&cmd_mode_update_timer, cmd_mode_update_timer_period, HRTIMER_MODE_REL);
+            }
+        }
+
+        //MMProfileLog(MTKFB_MMP_Events.UpdateConfig, MMProfileFlagEnd);
+        //MMProfileLogEx(MTKFB_MMP_Events.EarlySuspend, MMProfileFlagEnd, 1, 0);
+        up(&sem_early_suspend);
+        if (kthread_should_stop())
+            break;
+    }
+
+    return 0;
+}
+
+static void _DISP_HWDoneCallback(void* pParam)
+{
+    MMProfileLogEx(MTKFB_MMP_Events.DispDone, MMProfileFlagPulse, is_early_suspended, 0);
+    // For DPI, this callback is called each time DPI VSync arrives.
+    // So trigger disp done event only in early suspend.
+    if ((lcm_params->type != LCM_TYPE_DPI) || (is_early_suspended))
+    {
+        // Disable DPI immediately to avoid restarting of DDP.
+        if (lcm_params->type == LCM_TYPE_DPI)
+            DPI_DisableClk();
+        disp_running = 0;
+        wake_up_interruptible(&disp_done_wq);
+    }
+}
+
+static void _DISP_VSyncCallback(void* pParam)
+{
+    MMProfileLog(MTKFB_MMP_Events.VSync, MMProfileFlagPulse);
+    vsync_wq_flag = 1;
+    wake_up_interruptible(&vsync_wq);
+}
+
+static void _DISP_RegUpdateCallback(void* pParam)
+{
+    MMProfileLog(MTKFB_MMP_Events.RegUpdate, MMProfileFlagPulse);
+    realtime_layer_config = captured_layer_config;
+    if ((lcm_params->type == LCM_TYPE_DPI) ||
+        ((lcm_params->type == LCM_TYPE_DSI) && (lcm_params->dsi.mode != CMD_MODE)))
+    {
+    	if ((PanDispSettingPending==1) && (PanDispSettingDirty==0))
+    	{
+			PanDispSettingApplied = 1;
+			PanDispSettingPending = 0;
+	    }
+        atomic_set(&OverlaySettingApplied, 1);
+    }
+    gWakeupCaptureOvlThread = 1;
+    wake_up_interruptible(&reg_update_wq);
+}
+
+static void _DISP_TargetLineCallback(void* pParam)
+{
+    //tasklet_hi_schedule(&ConfigUpdateTask);
+    MMProfileLogEx(MTKFB_MMP_Events.UpdateConfig, MMProfileFlagPulse, 0, 0);
+    config_update_task_wakeup = 1;
+    wake_up_interruptible(&config_update_wq);
+}
+
+static void _DISP_CmdDoneCallback(void* pParam)
+{
+    //tasklet_hi_schedule(&ConfigUpdateTask);
+    MMProfileLogEx(MTKFB_MMP_Events.UpdateConfig, MMProfileFlagPulse, 1, 0);
+    config_update_task_wakeup = 1;
+    wake_up_interruptible(&config_update_wq);
+    _DISP_HWDoneCallback(NULL);
+}
+
+static enum hrtimer_restart _DISP_CmdModeTimer_handler(struct hrtimer *timer)
+{
+    MMProfileLogEx(MTKFB_MMP_Events.UpdateConfig, MMProfileFlagPulse, 2, 0);
+    config_update_task_wakeup = 1;
+    wake_up_interruptible(&config_update_wq);
     return HRTIMER_NORESTART;
 }
 #endif
 
-
-static unsigned int vsync_wait_time = 0;
-void DSI_WaitTE(void)
-{
-#ifndef BUILD_UBOOT	
-	wait_dsi_vsync = true;
-	
-	hrtimer_start(&hrtimer_vsync, ktime_set(0, VSYNC_US_TO_NS(vsync_timer)), HRTIMER_MODE_REL);
-    if (EnableVSyncLog)
-        printk("[DSI] +VSync\n");
-	wait_event_interruptible(_vsync_wait_queue, dsi_vsync);
-    if (EnableVSyncLog)
-        printk("[DSI] -VSync\n");
-	dsi_vsync = false;
-	wait_dsi_vsync = false;
-#endif
-}
-void DSI_InitVSYNC(unsigned int vsync_interval)
-{
-#ifndef BUILD_UBOOT
-    ktime_t ktime;
-	vsync_timer = vsync_interval;
-	ktime = ktime_set(0, VSYNC_US_TO_NS(vsync_timer));
-	hrtimer_init(&hrtimer_vsync, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	hrtimer_vsync.function = dsi_te_hrtimer_func;
-//	hrtimer_start(&hrtimer_vsync, ktime, HRTIMER_MODE_REL);
-#endif
-}
-
-static BOOL _IsEngineBusy(void)
-{
-	DSI_INT_STATUS_REG status;
-
-	status = DSI_REG->DSI_INTSTA;
-	
-	if (status.BUSY)		
-		return TRUE;
-	return FALSE;
-}
-
-#if 0
-static BOOL _IsCMDQBusy(void)
-{
-	DSI_INT_STATUS_REG INT_status;
-
-	INT_status=DSI_REG->DSI_INTSTA;
-
-	if (!INT_status.CMD_DONE)
-	{
-		DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI CMDQ status BUSY !!\n");
-	
-		return TRUE;
-	}
-
-	return FALSE;
-}
-#endif
-
-static void _WaitForEngineNotBusy(void)
-{
-    int timeOut;
-#if ENABLE_DSI_INTERRUPT
-    long int time;
-    static const long WAIT_TIMEOUT = 2 * HZ;    // 2 sec
-#endif
-
-	if (DSI_REG->DSI_MODE_CTRL.MODE)
-		return ;
-
-	timeOut = 200;
-
-#if ENABLE_DSI_INTERRUPT
-	time = get_current_time_us();
-
-    if (in_interrupt())
-    {
-        // perform busy waiting if in interrupt context
-		while(_IsEngineBusy()) {
-			msleep(1);
-			if (--timeOut < 0)	{
-						
-				DISP_LOG_PRINT(ANDROID_LOG_ERROR, "DSI", " Wait for DSI engine not busy timeout!!!(Wait %d us)\n", get_current_time_us() - time);
-				DSI_DumpRegisters();
-				DSI_Reset();
-				
-				break;
-			}
-		}
-    }
-    else
-    {
-        while (DSI_REG->DSI_INTSTA.BUSY || DSI_REG->DSI_INTSTA.CMD_DONE)
-        {
-            long ret = wait_event_interruptible_timeout(_dsi_wait_queue, 
-                                                        !_IsEngineBusy() && !(DSI_REG->DSI_INTSTA.CMD_DONE),
-                                                        WAIT_TIMEOUT);
-            if (0 == ret) {
-                DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " Wait for DSI engine not busy timeout!!!\n");
-				DSI_DumpRegisters();
-				DSI_Reset();
-				dsiTeEnable = false;
-            }
-        }
-    }
-#else
-
-	while(_IsEngineBusy()) {
-		udelay(100);
-		/*printk("xuecheng, dsi wait\n");*/
-		if (--timeOut < 0) {
-			DISP_LOG_PRINT(ANDROID_LOG_ERROR, "DSI", " Wait for DSI engine not busy timeout!!!\n");
-			DSI_DumpRegisters();
-			DSI_Reset();
-			dsiTeEnable = false;
-			break;
-		}
-	}
-	OUTREG32(&DSI_REG->DSI_INTSTA, 0x0);
-#endif    
-}
-void hdmi_dsi_waitnotbusy(void)
-{
-	_WaitForEngineNotBusy();
-}
-
-static void _BackupDSIRegisters(void)
-{
-    DSI_REGS *regs = &(_dsiContext.regBackup);
-	
-    //memcpy((void*)&(_dsiContext.regBackup), (void*)DSI_BASE, sizeof(DSI_REGS));
-
-    OUTREG32(&regs->DSI_INTEN, AS_UINT32(&DSI_REG->DSI_INTEN));
-    OUTREG32(&regs->DSI_MODE_CTRL, AS_UINT32(&DSI_REG->DSI_MODE_CTRL));
-    OUTREG32(&regs->DSI_TXRX_CTRL, AS_UINT32(&DSI_REG->DSI_TXRX_CTRL));
-    OUTREG32(&regs->DSI_PSCTRL, AS_UINT32(&DSI_REG->DSI_PSCTRL));
-
-    OUTREG32(&regs->DSI_VSA_NL, AS_UINT32(&DSI_REG->DSI_VSA_NL));		
-    OUTREG32(&regs->DSI_VBP_NL, AS_UINT32(&DSI_REG->DSI_VBP_NL));		
-    OUTREG32(&regs->DSI_VFP_NL, AS_UINT32(&DSI_REG->DSI_VFP_NL));		
-    OUTREG32(&regs->DSI_VACT_NL, AS_UINT32(&DSI_REG->DSI_VACT_NL));		
-
-    OUTREG32(&regs->DSI_HSA_WC, AS_UINT32(&DSI_REG->DSI_HSA_WC));		
-    OUTREG32(&regs->DSI_HBP_WC, AS_UINT32(&DSI_REG->DSI_HBP_WC));		
-    OUTREG32(&regs->DSI_HFP_WC, AS_UINT32(&DSI_REG->DSI_HFP_WC));		
-    OUTREG32(&regs->DSI_BLLP_WC, AS_UINT32(&DSI_REG->DSI_BLLP_WC));		
-	
-    OUTREG32(&regs->DSI_HSTX_CKL_WC, AS_UINT32(&DSI_REG->DSI_HSTX_CKL_WC));		
-    OUTREG32(&regs->DSI_MEM_CONTI, AS_UINT32(&DSI_REG->DSI_MEM_CONTI));
-
-    OUTREG32(&regs->DSI_PHY_TIMECON0, AS_UINT32(&DSI_REG->DSI_PHY_TIMECON0));
-    OUTREG32(&regs->DSI_PHY_TIMECON1, AS_UINT32(&DSI_REG->DSI_PHY_TIMECON1));
-    OUTREG32(&regs->DSI_PHY_TIMECON2, AS_UINT32(&DSI_REG->DSI_PHY_TIMECON2));
-    OUTREG32(&regs->DSI_PHY_TIMECON3, AS_UINT32(&DSI_REG->DSI_PHY_TIMECON3));
-	
-}
-
-static void _RestoreDSIRegisters(void)
-{
-    DSI_REGS *regs = &(_dsiContext.regBackup);
-
-    OUTREG32(&DSI_REG->DSI_INTEN, AS_UINT32(&regs->DSI_INTEN));	
-    OUTREG32(&DSI_REG->DSI_MODE_CTRL, AS_UINT32(&regs->DSI_MODE_CTRL));	
-    OUTREG32(&DSI_REG->DSI_TXRX_CTRL, AS_UINT32(&regs->DSI_TXRX_CTRL));	
-    OUTREG32(&DSI_REG->DSI_PSCTRL, AS_UINT32(&regs->DSI_PSCTRL));	
-
-    OUTREG32(&DSI_REG->DSI_VSA_NL, AS_UINT32(&regs->DSI_VSA_NL));		
-    OUTREG32(&DSI_REG->DSI_VBP_NL, AS_UINT32(&regs->DSI_VBP_NL));		
-    OUTREG32(&DSI_REG->DSI_VFP_NL, AS_UINT32(&regs->DSI_VFP_NL));		
-    OUTREG32(&DSI_REG->DSI_VACT_NL, AS_UINT32(&regs->DSI_VACT_NL));		
-
-    OUTREG32(&DSI_REG->DSI_HSA_WC, AS_UINT32(&regs->DSI_HSA_WC));		
-    OUTREG32(&DSI_REG->DSI_HBP_WC, AS_UINT32(&regs->DSI_HBP_WC));		
-    OUTREG32(&DSI_REG->DSI_HFP_WC, AS_UINT32(&regs->DSI_HFP_WC));	
-    OUTREG32(&DSI_REG->DSI_BLLP_WC, AS_UINT32(&regs->DSI_BLLP_WC));		
-
-    OUTREG32(&DSI_REG->DSI_HSTX_CKL_WC, AS_UINT32(&regs->DSI_HSTX_CKL_WC));		
-    OUTREG32(&DSI_REG->DSI_MEM_CONTI, AS_UINT32(&regs->DSI_MEM_CONTI));		
-
-    OUTREG32(&DSI_REG->DSI_PHY_TIMECON0, AS_UINT32(&regs->DSI_PHY_TIMECON0));		
-    OUTREG32(&DSI_REG->DSI_PHY_TIMECON1, AS_UINT32(&regs->DSI_PHY_TIMECON1));
-    OUTREG32(&DSI_REG->DSI_PHY_TIMECON2, AS_UINT32(&regs->DSI_PHY_TIMECON2));		
-    OUTREG32(&DSI_REG->DSI_PHY_TIMECON3, AS_UINT32(&regs->DSI_PHY_TIMECON3));		
-
-}
-
-static void _ResetBackupedDSIRegisterValues(void)
-{
-    DSI_REGS *regs = &_dsiContext.regBackup;
-    memset((void*)regs, 0, sizeof(DSI_REGS));
-}
-
-
-static void DSI_BackUpCmdQ(void)
-{
-	unsigned int i;
-	DSI_CMDQ_REGS *regs = &(_dsiContext.cmdqBackup);
-
-	_dsiContext.cmdq_size = AS_UINT32(&DSI_REG->DSI_CMDQ_SIZE);
-
-	for (i=0; i<_dsiContext.cmdq_size; i++)
-		OUTREG32(&regs->data[i], AS_UINT32(&DSI_CMDQ_REG->data[i]));
-}
-
-
-static void DSI_RestoreCmdQ(void)
-{
-	unsigned int i;
-	DSI_CMDQ_REGS *regs = &(_dsiContext.cmdqBackup);
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, AS_UINT32(&_dsiContext.cmdq_size));
-
-	for (i=0; i<_dsiContext.cmdq_size; i++)
-		OUTREG32(&DSI_CMDQ_REG->data[i], AS_UINT32(&regs->data[i]));
-}
-
-static void _DSI_RDMA0_IRQ_Handler(unsigned int param);
-DSI_STATUS DSI_Init(BOOL isDsiPoweredOn)
-{
-    DSI_STATUS ret = DSI_STATUS_OK;
-
-    memset(&_dsiContext, 0, sizeof(_dsiContext));
-
-    if (isDsiPoweredOn) {
-        _BackupDSIRegisters();
-    } else {
-        _ResetBackupedDSIRegisterValues();
-    }
-	ret = DSI_PowerOn();
-
-	OUTREG32(&DSI_REG->DSI_MEM_CONTI, DSI_WMEM_CONTI);	
-
-    ASSERT(ret == DSI_STATUS_OK);
-/*
-    mipitx_con0=DSI_PHY_REG->MIPITX_CON0;
-    mipitx_con1=DSI_PHY_REG->MIPITX_CON1;
-    mipitx_con3=DSI_PHY_REG->MIPITX_CON3;
-    mipitx_con6=DSI_PHY_REG->MIPITX_CON6;
-    mipitx_con8=DSI_PHY_REG->MIPITX_CON8;
-    mipitx_con9=DSI_PHY_REG->MIPITX_CON9;
-*/
-#if ENABLE_DSI_INTERRUPT
-    init_waitqueue_head(&_dsi_wait_queue);
-    init_waitqueue_head(&_dsi_dcs_read_wait_queue);	
-	init_waitqueue_head(&_dsi_wait_bta_te);
-	init_waitqueue_head(&_dsi_wait_vm_done_queue);
-    if (request_irq(MT6589_DISP_DSI_IRQ_ID,
-        _DSI_InterruptHandler, IRQF_TRIGGER_LOW, MTKFB_DRIVER, NULL) < 0)
-    {
-        DISP_LOG_PRINT(ANDROID_LOG_ERROR, "DSI", "fail to request DSI irq\n"); 
-        return DSI_STATUS_ERROR;
-    }
-		//mt65xx_irq_unmask(MT6577_DSI_IRQ_ID);
-    //DSI_REG->DSI_INTEN.CMD_DONE=1;
-    //DSI_REG->DSI_INTEN.RD_RDY=1;
-	//DSI_REG->DSI_INTEN.TE_RDY = 1;
-    OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,CMD_DONE,1);
-    OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,RD_RDY,1);
-    OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,TE_RDY,1);
-
-init_waitqueue_head(&_vsync_wait_queue);
-	//DSI_REG->DSI_INTEN.VM_DONE = 1;
-	OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,VM_DONE,1);
-	init_waitqueue_head(&_vsync_wait_queue);
-
-	
-#endif
-    if (lcm_params->dsi.mode == DSI_CMD_MODE)
-        disp_register_irq(DISP_MODULE_RDMA0, _DSI_RDMA0_IRQ_Handler);
-    
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_Deinit(void)
-{
-    DSI_STATUS ret = DSI_PowerOff();
-
-    ASSERT(ret == DSI_STATUS_OK);
-
-    return DSI_STATUS_OK;
-}
-
-#ifdef BUILD_UBOOT
-DSI_STATUS DSI_PowerOn(void)
-{
-
-    if (!s_isDsiPowerOn)
-    {
-#if 0   // FIXME
-        BOOL ret = hwEnableClock(MT_CG_DISP1_DSI_ENGINE, "DSI");
-        BOOL ret = hwEnableClock(MT_CG_DISP1_DSI_DIGITAL, "DSI");
-        BOOL ret = hwEnableClock(MT_CG_DISP1_DSI_LANE, "DSI");
-        ASSERT(ret);
-#else
-		MASKREG32(0x14000110, 0x38, 0x0);
-		printf("[DISP] - uboot - DSI_PowerOn. 0x%8x\n", INREG32(0x14000110));
-#endif        
-        _RestoreDSIRegisters();
-	//_WaitForEngineNotBusy();		
-        s_isDsiPowerOn = TRUE;
-    }
-
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_PowerOff(void)
-{
-
-    if (s_isDsiPowerOn)
-    {
-        BOOL ret = TRUE;
-        //_WaitForEngineNotBusy();
-        _BackupDSIRegisters();
-#if 0   // FIXME
-         BOOL ret = hwDisableClock(MT_CG_DISP1_DSI_ENGINE, "DSI");
-        BOOL ret = hwDisableClock(MT_CG_DISP1_DSI_DIGITAL, "DSI");
-        BOOL ret = hwDisableClock(MT_CG_DISP1_DSI_LANE, "DSI");
-        ASSERT(ret);
-#else
-		//*(unsigned int*)&DSI_REG->DSI_INTSTA = 0;
-		OUTREG32(&DSI_REG->DSI_INTSTA, 0);
- 		MASKREG32(0x14000110, 0x38, 0x38);
-		printf("[DISP] - uboot - DSI_PowerOn. 0x%8x\n", INREG32(0x14000110));
-#endif        
-        s_isDsiPowerOn = FALSE;
-    }
-    
-    return DSI_STATUS_OK;
-}
-
-#else
-DSI_STATUS DSI_PowerOn(void)
-{
-	int ret = 0;
-    if (!s_isDsiPowerOn)
-    {
-#if 1   // FIXME
-		ret += enable_clock(MT_CG_DISP1_DSI_ENGINE, "DSI");
-		ret += enable_clock(MT_CG_DISP1_DSI_DIGITAL, "DSI");
-		ret += enable_clock(MT_CG_DISP1_DSI_DIGITAL_LANE, "DSI");
-		ASSERT(!ret);
-#endif        
-//		DSI_Reset();
-        _RestoreDSIRegisters();
-        s_isDsiPowerOn = TRUE;
-    }
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_PowerOff(void)
-{
-	int ret = 0;
-    if (s_isDsiPowerOn)
-    {
-        _WaitForEngineNotBusy();
-        _BackupDSIRegisters();
-#if 1   // FIXME
-        //*(unsigned int*)&DSI_REG->DSI_INTSTA = 0;
-        OUTREG32(&DSI_REG->DSI_INTSTA, 0);
-		ret += disable_clock(MT_CG_DISP1_DSI_ENGINE, "DSI");
-		ret += disable_clock(MT_CG_DISP1_DSI_DIGITAL, "DSI");
-		ret += disable_clock(MT_CG_DISP1_DSI_DIGITAL_LANE, "DSI");
-		ASSERT(!ret);
-#endif        
-        s_isDsiPowerOn = FALSE;
-    }
-    return DSI_STATUS_OK;
-}
-#endif
-
-DSI_STATUS DSI_WaitForNotBusy(void)
-{
-    _WaitForEngineNotBusy();
-
-    return DSI_STATUS_OK;
-}
-
-
-static void DSI_WaitBtaTE(void)
-{
-	DSI_T0_INS t0;
-#if ENABLE_DSI_INTERRUPT
-	long ret;
-	static const long WAIT_TIMEOUT = 2 * HZ;	// 2 sec
-#else
-	long int dsi_current_time;
-#endif
-
-	if(DSI_REG->DSI_MODE_CTRL.MODE != CMD_MODE)
-		return DSI_STATUS_OK;
-
-	_WaitForEngineNotBusy();
-
-	// backup command queue setting.
-	DSI_BackUpCmdQ();
-
-	t0.CONFG = 0x20;		///TE
-	t0.Data0 = 0;
-	t0.Data_ID = 0;
-	t0.Data1 = 0;
-
-	OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-
-	//DSI_REG->DSI_START.DSI_START=0;
-	//DSI_REG->DSI_START.DSI_START=1;
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,0);
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,1);
-
-	// wait BTA TE command complete.
-	_WaitForEngineNotBusy();
-
-	// restore command queue setting.
-	DSI_RestoreCmdQ();
-
-#if ENABLE_DSI_INTERRUPT
-
-	ret = wait_event_interruptible_timeout(_dsi_wait_bta_te, 
-											!_IsEngineBusy(),
-											WAIT_TIMEOUT);
-
-	if (0 == ret) {
-		DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", "Wait for _dsi_wait_bta_te(DSI_INTSTA.TE_RDY) ready timeout!!!\n");
-
-		// Set DSI_RACK to let DSI idle
-		//DSI_REG->DSI_RACK.DSI_RACK = 1;
-		OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-
-		DSI_DumpRegisters();	
-		///do necessary reset here
-		DSI_Reset();
-		dsiTeEnable = false;//disable TE
-		return ret;
-	}
-
-	// After setting DSI_RACK, it needs to wait for CMD_DONE interrupt.
-	_WaitForEngineNotBusy();
-
-#else
-
-	dsi_current_time = get_current_time_us();
-
-	while(DSI_REG->DSI_INTSTA.TE_RDY == 0)	// polling TE_RDY
-	{
-		if(get_current_time_us() - dsi_current_time > 100*1000)
-		{
-			DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", "Wait for TE_RDY timeout!!!\n");
-
-			// Set DSI_RACK to let DSI idle
-			//DSI_REG->DSI_RACK.DSI_RACK = 1;
-			OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-
-			DSI_DumpRegisters();
-
-			//do necessary reset here
-			DSI_Reset();
-			dsiTeEnable = false;//disable TE
-			break;
-		}
-	}
-
-	// Write clear RD_RDY
-	//DSI_REG->DSI_INTSTA.TE_RDY = 0;
-	OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,TE_RDY,0);
-
-	// Set DSI_RACK to let DSI idle
-	//DSI_REG->DSI_RACK.DSI_RACK = 1;
-	OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-	if(!dsiTeEnable){
-		DSI_LP_Reset();
-		return;
-	}
-	dsi_current_time = get_current_time_us();
-
-	while(DSI_REG->DSI_INTSTA.CMD_DONE == 0)	// polling CMD_DONE
-	{
-		if(get_current_time_us() - dsi_current_time > 100*1000)
-		{
-			DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", "Wait for CMD_DONE timeout!!!\n");
-
-			// Set DSI_RACK to let DSI idle
-			//DSI_REG->DSI_RACK.DSI_RACK = 1;
-			OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-
-			DSI_DumpRegisters();
-
-			///do necessary reset here
-			DSI_Reset();
-			dsiTeEnable = false;//disable TE
-			break;
-		}
-	}
-
-	// Write clear CMD_DONE
-	//DSI_REG->DSI_INTSTA.CMD_DONE = 0;
-	OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,CMD_DONE,0);
-
-#endif
-	DSI_LP_Reset();
-}
-
-
-DSI_STATUS DSI_EnableClk(void)
-{
-	_WaitForEngineNotBusy();
-
-	//DSI_REG->DSI_START.DSI_START=0;
-	//DSI_REG->DSI_START.DSI_START=1;
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,0);
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,1);
-
-
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_StartTransfer(bool isMutexLocked)
-{
-    // needStartDSI = 1: For command mode or the first time of video mode.
-    // After the first time of video mode. Configuration is applied in ConfigurationUpdateTask.
-    extern struct mutex OverlaySettingMutex;
-    if (!isMutexLocked)
-        disp_path_get_mutex();
-    mutex_lock(&OverlaySettingMutex);
-    // isMutexLocked=false means it is the first time of DSI update after init or late resume.
-    // Layer config was not applied in config update thread.
-    // So need to config overlay here.
-    if (!isMutexLocked)
-    LCD_ConfigOVL();
-    // Insert log for trigger point.
-    DBG_OnTriggerLcd();
-
-    if (dsiTeEnable)
-        DSI_WaitBtaTE();
-
-    _WaitForEngineNotBusy();
-    lcdStartTransfer = true;
-
-    // To trigger frame update.
-    DSI_EnableClk();
-    mutex_unlock(&OverlaySettingMutex);
-    if (!isMutexLocked)
-        disp_path_release_mutex();
-	return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_DisableClk(void)
-{
-	//DSI_REG->DSI_START.DSI_START=0;
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,0);
-
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_Reset(void)
-{
-	//DSI_REG->DSI_COM_CTRL.DSI_RESET = 1;
-	OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,1);
-	lcm_mdelay(5);
-	//DSI_REG->DSI_COM_CTRL.DSI_RESET = 0;
-	OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,0);
-
-
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_LP_Reset(void)
-{
-	_WaitForEngineNotBusy();
-	OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,1);
-	OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,0);
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_SetMode(unsigned int mode)
-{
-
-	//DSI_REG->DSI_MODE_CTRL.MODE = mode;
-	OUTREGBIT(DSI_MODE_CTRL_REG,DSI_REG->DSI_MODE_CTRL,MODE,mode);
-	return DSI_STATUS_OK;
-}
-
-static void _DSI_RDMA0_IRQ_Handler(unsigned int param)
-{
-    if(_dsiContext.pIntCallback)
-    {
-        if (param & 4)
-        {
-            MMProfileLogEx(MTKFB_MMP_Events.ScreenUpdate, MMProfileFlagEnd, param, 0);
-        }
-        if (param & 8)
-        {
-            MMProfileLogEx(MTKFB_MMP_Events.ScreenUpdate, MMProfileFlagEnd, param, 0);
-        }
-        if (param & 2)
-        {
-            MMProfileLogEx(MTKFB_MMP_Events.ScreenUpdate, MMProfileFlagStart, param, 0);
-            _dsiContext.pIntCallback(DISP_DSI_VSYNC_INT);
-        }
-        if (param & 0x20)
-        {
-            _dsiContext.pIntCallback(DISP_DSI_TARGET_LINE_INT);
-        }
-    }
-}
-
-static void _DSI_MUTEX_IRQ_Handler(unsigned int param)
-{
-    if(_dsiContext.pIntCallback)
-    {
-        if (param & 1)
-        {
-            _dsiContext.pIntCallback(DISP_DSI_REG_UPDATE_INT);
-        }
-    }
-}
-
-DSI_STATUS DSI_EnableInterrupt(DISP_INTERRUPT_EVENTS eventID)
-{
-#if ENABLE_DSI_INTERRUPT
-    switch(eventID)
-    {
-        case DISP_DSI_READ_RDY_INT:
-            //DSI_REG->DSI_INTEN.RD_RDY = 1;
-            OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,RD_RDY,1);
-            break;
-        case DISP_DSI_CMD_DONE_INT:
-            //DSI_REG->DSI_INTEN.CMD_DONE = 1;
-            OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,CMD_DONE,1);
-            break;
-        case DISP_DSI_VMDONE_INT:
-            OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,VM_DONE,1);
-            break;
-        case DISP_DSI_VSYNC_INT:
-            disp_register_irq(DISP_MODULE_RDMA0, _DSI_RDMA0_IRQ_Handler);
-            break;
-        case DISP_DSI_TARGET_LINE_INT:
-            disp_register_irq(DISP_MODULE_RDMA0, _DSI_RDMA0_IRQ_Handler);
-            break;
-        case DISP_DSI_REG_UPDATE_INT:
-            //wake_up_interruptible(&_dsi_reg_update_wq);
-            disp_register_irq(DISP_MODULE_MUTEX, _DSI_MUTEX_IRQ_Handler);
-            break;
-        default:
-            return DSI_STATUS_ERROR;
-    }
-
-    return DSI_STATUS_OK;
-#else
-    ///TODO: warning log here
-    return DSI_STATUS_ERROR;
-#endif
-}
-
-
-DSI_STATUS DSI_SetInterruptCallback(void (*pCB)(DISP_INTERRUPT_EVENTS))
-{
-    _dsiContext.pIntCallback = pCB;
-
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_handle_TE(void)
-{
-
-	unsigned int data_array;
-
-	//data_array=0x00351504;
-	//DSI_set_cmdq(&data_array, 1, 1);
-
-	//lcm_mdelay(10);
-
-	// RACT	
-	//data_array=1;
-	//OUTREG32(&DSI_REG->DSI_RACK, data_array);
-
-	// TE + BTA
-	data_array=0x24;
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] DSI_handle_TE TE + BTA !! \n");
-	OUTREG32(&DSI_CMDQ_REG->data, data_array);
-
-	//DSI_CMDQ_REG->data.byte0=0x24;
-	//DSI_CMDQ_REG->data.byte1=0;
-	//DSI_CMDQ_REG->data.byte2=0;
-	//DSI_CMDQ_REG->data.byte3=0;
-
-	//DSI_REG->DSI_CMDQ_SIZE.CMDQ_SIZE=1;
-	OUTREGBIT(DSI_CMDQ_CTRL_REG,DSI_REG->DSI_CMDQ_SIZE,CMDQ_SIZE,1);
-
-	//DSI_REG->DSI_START.DSI_START=0;
-	//DSI_REG->DSI_START.DSI_START=1;
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,0);
-	OUTREGBIT(DSI_START_REG,DSI_REG->DSI_START,DSI_START,1);
-
-
-	// wait TE Trigger status
-//	do
-//	{
-		lcm_mdelay(10);
-
-		data_array=INREG32(&DSI_REG->DSI_INTSTA);
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] DSI INT state : %x !! \n", data_array);
-	
-		data_array=INREG32(&DSI_REG->DSI_TRIG_STA);
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] DSI TRIG TE status check : %x !! \n", data_array);
-//	} while(!(data_array&0x4));
-
-	// RACT	
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] DSI Set RACT !! \n");
-	data_array=1;
-	OUTREG32(&DSI_REG->DSI_RACK, data_array);
-
-	return DSI_STATUS_OK;
-
-}
-
-void DSI_PLL_Select(unsigned int pll_select)
-{
-	if(pll_select == 1){
-		//ASSERT(0 == enable_pll_hp(LVDSPLL));
-		ASSERT(0 == pll_hp_switch_on(LVDSPLL, 0));
-		ASSERT(0 == enable_pll(LVDSPLL,"mtk_dsi"));
-	}
-}
-
-#define ALIGN_TO(x, n)  \
-	(((x) + ((n) - 1)) & ~((n) - 1))
-unsigned int dsi_cycle_time;
-
-void DSI_Config_VDO_Timing(LCM_PARAMS *lcm_params)
-{
-	unsigned int line_byte;
-	unsigned int horizontal_sync_active_byte;
-	unsigned int horizontal_backporch_byte;
-	unsigned int horizontal_frontporch_byte;
-	unsigned int dsiTmpBufBpp;
-
-	#define LINE_PERIOD_US				(8 * line_byte * _dsiContext.bit_time_ns / 1000)
-
-	if(lcm_params->dsi.data_format.format == LCM_DSI_FORMAT_RGB565)
-		dsiTmpBufBpp = 2;
-	else
-		dsiTmpBufBpp = 3;
-
-	OUTREG32(&DSI_REG->DSI_VSA_NL, lcm_params->dsi.vertical_sync_active);
-	OUTREG32(&DSI_REG->DSI_VBP_NL, lcm_params->dsi.vertical_backporch);
-	OUTREG32(&DSI_REG->DSI_VFP_NL, lcm_params->dsi.vertical_frontporch);
-	OUTREG32(&DSI_REG->DSI_VACT_NL, lcm_params->dsi.vertical_active_line);
-
-	line_byte							=	(lcm_params->dsi.horizontal_sync_active \
-											+ lcm_params->dsi.horizontal_backporch \
-											+ lcm_params->dsi.horizontal_frontporch \
-											+ lcm_params->dsi.horizontal_active_pixel) * dsiTmpBufBpp;
-
-	if (lcm_params->dsi.mode == SYNC_EVENT_VDO_MODE || lcm_params->dsi.mode == BURST_VDO_MODE ){
-		ASSERT((lcm_params->dsi.horizontal_backporch + lcm_params->dsi.horizontal_sync_active) * dsiTmpBufBpp> 9);
-		horizontal_backporch_byte		=	((lcm_params->dsi.horizontal_backporch + lcm_params->dsi.horizontal_sync_active)* dsiTmpBufBpp - 10);
-	}
-	else{
-		ASSERT(lcm_params->dsi.horizontal_sync_active * dsiTmpBufBpp > 9);
-		horizontal_sync_active_byte 		=	(lcm_params->dsi.horizontal_sync_active * dsiTmpBufBpp - 10);
-	
-		ASSERT(lcm_params->dsi.horizontal_backporch * dsiTmpBufBpp > 9);
-		horizontal_backporch_byte		=	(lcm_params->dsi.horizontal_backporch * dsiTmpBufBpp - 10);
-	}
-
-	ASSERT(lcm_params->dsi.horizontal_frontporch * dsiTmpBufBpp > 11);
-	horizontal_frontporch_byte			=	(lcm_params->dsi.horizontal_frontporch * dsiTmpBufBpp - 12);
-
-//	ASSERT(lcm_params->dsi.horizontal_frontporch * dsiTmpBufBpp > ((300/dsi_cycle_time) * lcm_params->dsi.LANE_NUM));
-//	horizontal_frontporch_byte -= ((300/dsi_cycle_time) * lcm_params->dsi.LANE_NUM);
-
-	OUTREG32(&DSI_REG->DSI_HSA_WC, ALIGN_TO((horizontal_sync_active_byte), 4));
-	OUTREG32(&DSI_REG->DSI_HBP_WC, ALIGN_TO((horizontal_backporch_byte), 4));
-	OUTREG32(&DSI_REG->DSI_HFP_WC, ALIGN_TO((horizontal_frontporch_byte), 4));
-
-	_dsiContext.vfp_period_us 		= LINE_PERIOD_US * lcm_params->dsi.vertical_frontporch / 1000;
-	_dsiContext.vsa_vs_period_us	= LINE_PERIOD_US * 1 / 1000;
-	_dsiContext.vsa_hs_period_us	= LINE_PERIOD_US * (lcm_params->dsi.vertical_sync_active - 2) / 1000;
-	_dsiContext.vsa_ve_period_us	= LINE_PERIOD_US * 1 / 1000;
-	_dsiContext.vbp_period_us		= LINE_PERIOD_US * lcm_params->dsi.vertical_backporch / 1000;
-
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] kernel - video timing, mode = %d \n", lcm_params->dsi.mode);
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] kernel - VSA : %d %d(us)\n", DSI_REG->DSI_VSA_NL, (_dsiContext.vsa_vs_period_us+_dsiContext.vsa_hs_period_us+_dsiContext.vsa_ve_period_us));
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] kernel - VBP : %d %d(us)\n", DSI_REG->DSI_VBP_NL, _dsiContext.vbp_period_us);
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] kernel - VFP : %d %d(us)\n", DSI_REG->DSI_VFP_NL, _dsiContext.vfp_period_us);
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] kernel - VACT: %d \n", DSI_REG->DSI_VACT_NL);
-}
-
-
-void DSI_PHY_clk_setting(LCM_PARAMS *lcm_params)
-{//need re-write
-#if 0
-	MASKREG32(MIPI_CONFIG_BASE + 0x44, 0x3, 0x3);
-	MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x2, 0x2);
-//	msleep(1);
-	mdelay(1);
-#endif
-	MASKREG32(MIPI_CONFIG_BASE + 0x80, 0x1, 0x1);//switch MIPI TX config to SW mode
-	MASKREG32(MIPI_CONFIG_BASE + 0x44, 0x3, 0x3);
-	MASKREG32(MIPI_CONFIG_BASE, 0x3, 0x3);
-//	msleep(1);
-	mdelay(1);
-
-//	MASKREG32(MIPI_CONFIG_BASE + 0x44, 0x3, 0x3);
-//	MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x2, 0x2);
-	//	msleep(1);
-	mdelay(1);
-
-	MASKREG32(MIPI_CONFIG_BASE + 0x60, 0x600, 0x400);
-	
-	if(LCM_DSI_6589_PLL_CLOCK_NULL != lcm_params->dsi.PLL_CLOCK){
-		unsigned int i = lcm_params->dsi.PLL_CLOCK - 1;
-		printk("LCM PLL Config = %d, %d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i, pll_config[i].TXDIV0, pll_config[i].TXDIV1, pll_config[i].FBK_SEL, pll_config[i].FBK_DIV,
-		pll_config[i].PRE_DIV, pll_config[i].RG_BR, pll_config[i].RG_BC, pll_config[i].RG_BIR, pll_config[i].RG_BIC, pll_config[i].RG_BP);
-		MASKREG32(MIPI_CONFIG_BASE + 0x50, 0xFFFFFFFE, 
-			(pll_config[i].RG_BR<<30)|(pll_config[i].RG_BC<<28)|(pll_config[i].RG_BP<<24)|(pll_config[i].RG_BIR<<20)
-			|(pll_config[i].RG_BIC<<16)|(pll_config[i].FBK_DIV<<1)|(pll_config[i].FBK_SEL<<10)
-			|(pll_config[i].TXDIV1<<14)|(pll_config[i].TXDIV0<<12)|(pll_config[i].PRE_DIV<<8));
-	}	
-	else if((lcm_params->dsi.rg_bp == 0) | (lcm_params->dsi.rg_bir == 0) | (lcm_params->dsi.rg_bic == 0))
-		MASKREG32(MIPI_CONFIG_BASE + 0x50, 0xF0FE, 
-			(lcm_params->dsi.fbk_div<<1)|(lcm_params->dsi.pll_div2<<14)|(lcm_params->dsi.pll_div1<<12));
-	else
-		MASKREG32(MIPI_CONFIG_BASE + 0x50, 0xFFFFFCFE, 
-			(0xA<<28)|(lcm_params->dsi.rg_bp<<24)|(lcm_params->dsi.rg_bir<<20)
-			|(lcm_params->dsi.rg_bic<<16)|(lcm_params->dsi.fbk_div<<1)|(lcm_params->dsi.fbk_sel<<10)
-			|(lcm_params->dsi.pll_div2<<14)|(lcm_params->dsi.pll_div1<<12));
-	
-	MASKREG32(MIPI_CONFIG_BASE + 0x50, 0x1, 0x1);
-//	msleep(1);
-	mdelay(1);
-	MASKREG32(MIPI_CONFIG_BASE + 0x60, 0x600, 0x600);
-	
-	mdelay(1);
-	MASKREG32(MIPI_CONFIG_BASE + 0x4, 0x1, 0x1);
-	MASKREG32(MIPI_CONFIG_BASE + 0x8, 0x1, 0x1);
-	MASKREG32(MIPI_CONFIG_BASE + 0xc, 0x1, 0x1);
-	MASKREG32(MIPI_CONFIG_BASE + 0x10, 0x1, 0x1);
-	MASKREG32(MIPI_CONFIG_BASE + 0x14, 0x1, 0x1);
-
-	MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x2, 0x2);
-	mdelay(1);//must
-	MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x800, 0x0);
-	
-	MASKREG32(MIPI_CONFIG_BASE + 0x84, 0x600, 0x200);//Set DP/DN as mark-1 state
-	mdelay(1);//must
-	MASKREG32(MIPI_CONFIG_BASE + 0x84, 0x600, 0x600);//Set DP/DN as mark-1 state
-	MASKREG32(MIPI_CONFIG_BASE + 0x80, 0x1, 0x0);//switch MIPI TX config to DSI mode
-}
-
-#ifdef BUILD_UBOOT
-void DSI_PHY_clk_switch(bool on)
-{
-	MIPITX_CFG0_REG mipitx_con0=DSI_PHY_REG->MIPITX_CON0;
-
-	if(on)
-		mipitx_con0.PLL_EN=1;
-	else
-		mipitx_con0.PLL_EN=0;
-
-	//DSI_PHY_REG->MIPITX_CON0=mipitx_con0;
-	OUTREG32(&DSI_PHY_REG->MIPITX_CON0,AS_UINT32(&mipitx_con0));
-}
-#else
-void DSI_PHY_clk_switch(bool on)
-{
-#if 1
-	if(on){//workaround: do nothing
-	}
-	else
-	{
-		OUTREG32(MIPI_CONFIG_BASE + 0x84, 0x0);//switch MIPI TX config to SW mode
-		OUTREG32(MIPI_CONFIG_BASE + 0x88, 0x0);//switch MIPI TX config to SW mode
-		MASKREG32(MIPI_CONFIG_BASE + 0x80, 0x1, 0x1);//switch MIPI TX config to SW mode
-
-		MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x800, 0x800);
-		
-		MASKREG32(MIPI_CONFIG_BASE + 0x4, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x8, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0xc, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x10, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x14, 0x1, 0x0);
-		//DSI_PHY_clk_adjusting();
-		
-//		MASKREG32(MIPI_CONFIG_BASE + 0x44, 0x3, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x40, 0x2, 0x0);
-	//	msleep(1);
-//		MASKREG32(MIPI_CONFIG_BASE, 0x3, 0x0);
-	//	msleep(1);
-		mdelay(1);
-		MASKREG32(MIPI_CONFIG_BASE + 0x60, 0x600, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x50, 0xF0FE, 0x26);
-	
-		MASKREG32(MIPI_CONFIG_BASE + 0x50, 0x1, 0x0);
-	//	msleep(1);
-		mdelay(1);
-		MASKREG32(MIPI_CONFIG_BASE, 0x3, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x44, 0x3, 0x0);
-		mdelay(1);
-	#if 0
-		MASKREG32(MIPI_CONFIG_BASE + 0x4, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x8, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0xc, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x10, 0x1, 0x0);
-		MASKREG32(MIPI_CONFIG_BASE + 0x14, 0x1, 0x0);
-	#endif
-
-	}
-#endif
-}
-#endif
-
-void DSI_PHY_TIMCONFIG(LCM_PARAMS *lcm_params)
-{
-	DSI_PHY_TIMCON0_REG timcon0;
-	DSI_PHY_TIMCON1_REG timcon1;	
-	DSI_PHY_TIMCON2_REG timcon2;
-	DSI_PHY_TIMCON3_REG timcon3;
-	unsigned int div1 = 0;
-	unsigned int div2 = 0;
-	unsigned int fbk_sel = 0;
-	unsigned int pre_div = 0;
-	unsigned int fbk_div = 0;
-	unsigned int lane_no = lcm_params->dsi.LANE_NUM;
-
-//	unsigned int div2_real;
-	unsigned int cycle_time;
-	unsigned int ui;
-	unsigned int hs_trail_m, hs_trail_n;
-
-	if(LCM_DSI_6589_PLL_CLOCK_NULL != lcm_params->dsi.PLL_CLOCK){
-		div1 = pll_config[lcm_params->dsi.PLL_CLOCK - 1].TXDIV0;
-		div2 = pll_config[lcm_params->dsi.PLL_CLOCK - 1].TXDIV1;
-		fbk_sel = pll_config[lcm_params->dsi.PLL_CLOCK - 1].FBK_SEL;
-		fbk_div = pll_config[lcm_params->dsi.PLL_CLOCK - 1].FBK_DIV;
-		pre_div = pll_config[lcm_params->dsi.PLL_CLOCK - 1].PRE_DIV;
-	}
-	else{
-		div1 = lcm_params->dsi.pll_div1;
-		div2 = lcm_params->dsi.pll_div2;
-		fbk_sel = lcm_params->dsi.fbk_sel;
-		fbk_div = lcm_params->dsi.fbk_div;
-	}
-
-	switch(div1)
-	{
-	case 0:div1 = 1;break;
-	case 1:div1 = 2;break;
-	case 2:
-	case 3:div1 = 4;break;
-	default:
-		printk("div1 should be less than 4!!\n");
-		div1 = 4;
-		break;
-	}
-	switch(div2)
-	{
-	case 0:div2 = 1;break;
-	case 1:div2 = 2;break;
-	case 2:
-	case 3:div2 = 4;break;
-	default:
-		printk("div2 should be less than 4!!\n");
-		div2 = 4;
-		break;
-	}
-	switch(fbk_sel)
-	{
-	case 0:fbk_sel = 1;break;
-	case 1:fbk_sel = 2;break;
-	case 2:
-	case 3:fbk_sel = 4;break;
-	default:
-		printk("fbk_sel should be less than 4!!\n");
-		fbk_sel = 4;
-		break;
-	}
-
-	switch(pre_div)
-	{
-	case 0:pre_div = 1;break;
-	case 1:pre_div = 2;break;
-	case 2:
-	case 3:pre_div = 4;break;
-	default:
-		printk("pre_div should be less than 4!!\n");
-		pre_div = 4;
-		break;
-	}
-	
-//	div2_real=div2 ? div2*0x02 : 0x1;
-	cycle_time = (8 * 1000 * div2 * div1 * pre_div)/ (26 * (fbk_div+0x01) * fbk_sel * 2);
-	ui = (1000 * div2 * div1 * pre_div)/ (26 * (fbk_div+0x01) * fbk_sel * 2) + 1;
-
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - DSI_PHY_TIMCONFIG, Cycle Time = %d(ns), Unit Interval = %d(ns). div1 = %d, div2 = %d, fbk_div = %d, lane# = %d \n", cycle_time, ui, div1, div2, fbk_div, lane_no); 		
-
-	#define NS_TO_CYCLE(n, c)	((n) / c + (( (n) % c) ? 1 : 0))
-
-	hs_trail_m=lane_no;
-	hs_trail_n= (lcm_params->dsi.HS_TRAIL == 0) ? NS_TO_CYCLE(((lane_no * 4 * ui) + 60), cycle_time) : lcm_params->dsi.HS_TRAIL;
-
-	// +3 is recommended from designer becauase of HW latency
-	timcon0.HS_TRAIL	= ((hs_trail_m > hs_trail_n) ? hs_trail_m : hs_trail_n) + 0x0a;
-	
-	timcon0.HS_PRPR 	= (lcm_params->dsi.HS_PRPR == 0) ? NS_TO_CYCLE((60 + 5 * ui), cycle_time) : lcm_params->dsi.HS_PRPR;
-	// HS_PRPR can't be 1.
-	if (timcon0.HS_PRPR == 0)
-		timcon0.HS_PRPR = 1;
-
-	timcon0.HS_ZERO 	= (lcm_params->dsi.HS_ZERO == 0) ? NS_TO_CYCLE((0xC8 + 0x0a * ui - timcon0.HS_PRPR * cycle_time), cycle_time) : lcm_params->dsi.HS_ZERO;
-	
-	timcon0.LPX 		= (lcm_params->dsi.LPX == 0) ? NS_TO_CYCLE(65, cycle_time) : lcm_params->dsi.LPX;
-	if(timcon0.LPX == 0) timcon0.LPX = 1;
-//	timcon1.TA_SACK 	= (lcm_params->dsi.TA_SACK == 0) ? 1 : lcm_params->dsi.TA_SACK;
-	timcon1.TA_GET 		= (lcm_params->dsi.TA_GET == 0) ? (5 * timcon0.LPX) : lcm_params->dsi.TA_GET;
-	timcon1.TA_SURE 	= (lcm_params->dsi.TA_SURE == 0) ? (3 * timcon0.LPX / 2) : lcm_params->dsi.TA_SURE;
-	timcon1.TA_GO 		= (lcm_params->dsi.TA_GO == 0) ? (4 * timcon0.LPX) : lcm_params->dsi.TA_GO;
-	timcon1.DA_HS_EXIT  = (lcm_params->dsi.DA_HS_EXIT == 0) ? (2 * timcon0.LPX) : lcm_params->dsi.DA_HS_EXIT;
-
-	timcon2.CLK_TRAIL 	= ((lcm_params->dsi.CLK_TRAIL == 0) ? NS_TO_CYCLE(0x64, cycle_time) : lcm_params->dsi.CLK_TRAIL) + 0x0a;
-	// CLK_TRAIL can't be 1.
-	if (timcon2.CLK_TRAIL < 2)
-		timcon2.CLK_TRAIL = 2;
-	
-//	timcon2.LPX_WAIT 	= (lcm_params->dsi.LPX_WAIT == 0) ? 1 : lcm_params->dsi.LPX_WAIT;
-	timcon2.CONT_DET 	= lcm_params->dsi.CONT_DET;
-
-	timcon3.CLK_HS_PRPR	= (lcm_params->dsi.CLK_HS_PRPR == 0) ? NS_TO_CYCLE(0x40, cycle_time) : lcm_params->dsi.CLK_HS_PRPR;
-	if(timcon3.CLK_HS_PRPR == 0) timcon3.CLK_HS_PRPR = 1;
-	
-	timcon2.CLK_ZERO	= (lcm_params->dsi.CLK_ZERO == 0) ? NS_TO_CYCLE(0x190 - timcon3.CLK_HS_PRPR * cycle_time, cycle_time) : lcm_params->dsi.CLK_ZERO;
-
-	timcon3.CLK_HS_EXIT= (lcm_params->dsi.CLK_HS_EXIT == 0) ? (2 * timcon0.LPX) : lcm_params->dsi.CLK_HS_EXIT;
-	
-	timcon3.CLK_HS_POST= (lcm_params->dsi.CLK_HS_POST == 0) ? NS_TO_CYCLE((80 + 52 * ui), cycle_time) : lcm_params->dsi.CLK_HS_POST;
-
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - DSI_PHY_TIMCONFIG, HS_TRAIL = %d, HS_ZERO = %d, HS_PRPR = %d, LPX = %d, TA_GET = %d, TA_SURE = %d, TA_GO = %d, CLK_TRAIL = %d, CLK_ZERO = %d, CLK_HS_PRPR = %d \n", \
-			timcon0.HS_TRAIL, timcon0.HS_ZERO, timcon0.HS_PRPR, timcon0.LPX, timcon1.TA_GET, timcon1.TA_SURE, timcon1.TA_GO, timcon2.CLK_TRAIL, timcon2.CLK_ZERO, timcon3.CLK_HS_PRPR);		
-
-	//DSI_REG->DSI_PHY_TIMECON0=timcon0;
-	//DSI_REG->DSI_PHY_TIMECON1=timcon1;
-	//DSI_REG->DSI_PHY_TIMECON2=timcon2;
-	//DSI_REG->DSI_PHY_TIMECON3=timcon3;
-	OUTREG32(&DSI_REG->DSI_PHY_TIMECON0,AS_UINT32(&timcon0));
-	OUTREG32(&DSI_REG->DSI_PHY_TIMECON1,AS_UINT32(&timcon1));
-	OUTREG32(&DSI_REG->DSI_PHY_TIMECON2,AS_UINT32(&timcon2));
-	OUTREG32(&DSI_REG->DSI_PHY_TIMECON3,AS_UINT32(&timcon3));
-	dsi_cycle_time = cycle_time;
-}
-
-
-
-void DSI_clk_ULP_mode(bool enter)
-{
-	DSI_PHY_LCCON_REG tmp_reg1;
-	//DSI_PHY_REG_ANACON0	tmp_reg2;
-
-	tmp_reg1=DSI_REG->DSI_PHY_LCCON;
-	//tmp_reg2=DSI_PHY_REG->ANACON0;
-
-	if(enter) {
-
-		tmp_reg1.LC_HS_TX_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.LC_ULPM_EN=1;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		//tmp_reg2.PLL_EN=0;
-		//OUTREG32(&DSI_PHY_REG->ANACON0, AS_UINT32(&tmp_reg2));
-
-	}
-	else {
-
-		//tmp_reg2.PLL_EN=1;
-		//OUTREG32(&DSI_PHY_REG->ANACON0, AS_UINT32(&tmp_reg2));
-		lcm_mdelay(1);
-		tmp_reg1.LC_ULPM_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.LC_WAKEUP_EN=1;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.LC_WAKEUP_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-
-	}
-}
-
-
-void DSI_clk_HS_mode(bool enter)
-{
-	DSI_PHY_LCCON_REG tmp_reg1 = DSI_REG->DSI_PHY_LCCON;
-
-	if(enter && !DSI_clk_HS_state()) {
-		tmp_reg1.LC_HS_TX_EN=1;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		//lcm_mdelay(1);
-	}
-	else if (!enter && DSI_clk_HS_state()) {
-		tmp_reg1.LC_HS_TX_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&tmp_reg1));
-		//lcm_mdelay(1);
-
-	}
-}	
-
-
-bool DSI_clk_HS_state(void)
-{
-	return DSI_REG->DSI_PHY_LCCON.LC_HS_TX_EN ? TRUE : FALSE;
-}
-
-
-void DSI_lane0_ULP_mode(bool enter)
-{
-	DSI_PHY_LD0CON_REG tmp_reg1;
-
-	tmp_reg1=DSI_REG->DSI_PHY_LD0CON;
-
-	if(enter) {
-		// suspend
-		tmp_reg1.L0_HS_TX_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.L0_ULPM_EN=1;
-		OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-	}
-	else {
-		// resume
-		tmp_reg1.L0_ULPM_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.L0_WAKEUP_EN=1;
-		OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-		tmp_reg1.L0_WAKEUP_EN=0;
-		OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&tmp_reg1));
-		lcm_mdelay(1);
-	}
-}
-
-#ifndef BUILD_UBOOT
-
-// called by DPI ISR
-void DSI_handle_esd_recovery(void)
-{
-}
-
-
-// called by "esd_recovery_kthread"
-bool DSI_esd_check(void)
+void DISP_InitVSYNC(unsigned int vsync_interval)
 {
 #ifndef MT65XX_NEW_DISP
-	bool result = false;
-
-	if(dsi_esd_recovery)
-		result = true;
-	else
-		result = false;
-
-	dsi_esd_recovery = false;
-#else
-	DSI_MODE_CTRL_REG mode_ctl, mode_ctl_backup;
-	bool result = false;
-	//backup video mode
-	OUTREG32(&mode_ctl_backup, AS_UINT32(&DSI_REG->DSI_MODE_CTRL));
-	OUTREG32(&mode_ctl, AS_UINT32(&DSI_REG->DSI_MODE_CTRL));
-	//set to cmd mode
-	mode_ctl.MODE = 0;
-	OUTREG32(&DSI_REG->DSI_MODE_CTRL, AS_UINT32(&mode_ctl));
-#if ENABLE_DSI_INTERRUPT 			//wait video mode done
-	static const long WAIT_TIMEOUT = 2 * HZ;	// 2 sec
-	long ret;
-
-	ret = wait_event_interruptible_timeout(_dsi_wait_vm_done_queue, 
-													 !_IsEngineBusy(),
-													 WAIT_TIMEOUT);
-	if (0 == ret) {
-		xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for DSI engine read ready timeout!!!\n");
-	
-		DSI_DumpRegisters();
-		///do necessary reset here
-		DSI_Reset();
-	  	return 0;
+	if((LCM_TYPE_DBI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode == CMD_MODE)){
+    	LCD_InitVSYNC(vsync_interval);
 	}
-
+	else if((LCM_TYPE_DPI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode != CMD_MODE)){
+		DPI_InitVSYNC(vsync_interval);
+	}
+	else
+	{
+	    DISP_LOG("DISP_FMDesense_Query():unknown interface\n");
+	}
 #else
-	unsigned int read_timeout_ms = 100;
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Start polling VM done ready!!!\n");
-#endif
-    while(DSI_REG->DSI_INTSTA.VM_DONE== 0)  //clear
+    DISP_INTERRUPT_CALLBACK_STRUCT cb;
+    init_waitqueue_head(&config_update_wq);
+    init_waitqueue_head(&vsync_wq);
+    config_update_task = kthread_create(
+        _DISP_ConfigUpdateKThread, NULL, "disp_config_update_kthread");
+
+    if (IS_ERR(config_update_task)) 
     {
-        ///keep polling
-        msleep(1);
-        read_timeout_ms --;
+        DISP_LOG("DISP_InitVSYNC(): Cannot create config update kthread\n");
+        return;
+    }
+    wake_up_process(config_update_task);
+    if (LCM_TYPE_DBI == lcm_params->type)
+    {
+        LCD_InitVSYNC(vsync_interval);
+        cmd_mode_update_timer_period = ktime_set(0 , vsync_interval*1000);//ktime_set(0, 14285714); // 70Hz
+        hrtimer_init(&cmd_mode_update_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+        cmd_mode_update_timer.function = _DISP_CmdModeTimer_handler;
+//        cb.pFunc = _DISP_VSyncCallback;
+//        DISP_SetInterruptCallback(DISP_LCD_SYNC_INT, &cb);
+        cb.pFunc = _DISP_CmdDoneCallback;
+        DISP_SetInterruptCallback(DISP_LCD_TRANSFER_COMPLETE_INT, &cb);
+        cb.pFunc = _DISP_RegUpdateCallback;
+        DISP_SetInterruptCallback(DISP_LCD_REG_COMPLETE_INT, &cb);
+        config_update_task_wakeup = 1;
+        wake_up_interruptible(&config_update_wq);
+    }
+    else if (LCM_TYPE_DPI == lcm_params->type)
+    {
+        RDMASetTargetLine(0, DISP_GetScreenHeight()*4/5);
+        cb.pFunc = _DISP_VSyncCallback;
+        DISP_SetInterruptCallback(DISP_DPI_VSYNC_INT, &cb);
+        cb.pFunc = _DISP_TargetLineCallback;
+        DISP_SetInterruptCallback(DISP_DPI_TARGET_LINE_INT, &cb);
+        cb.pFunc = _DISP_RegUpdateCallback;
+        DISP_SetInterruptCallback(DISP_DPI_REG_UPDATE_INT, &cb);
+    }
+    else if (LCM_TYPE_DSI == lcm_params->type)
+    {
+        if (CMD_MODE == lcm_params->dsi.mode)
+        {
+            DSI_InitVSYNC(vsync_interval);
+            cmd_mode_update_timer_period = ktime_set(0 , vsync_interval*1000);//ktime_set(0, 14285714); // 70Hz
+            hrtimer_init(&cmd_mode_update_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+            cmd_mode_update_timer.function = _DISP_CmdModeTimer_handler;
+//            cb.pFunc = _DISP_VSyncCallback;
+//            DISP_SetInterruptCallback(DISP_DSI_VSYNC_INT, &cb);
+            cb.pFunc = _DISP_CmdDoneCallback;
+            DISP_SetInterruptCallback(DISP_DSI_CMD_DONE_INT, &cb);
+            cb.pFunc = _DISP_RegUpdateCallback;
+            DISP_SetInterruptCallback(DISP_DSI_REG_UPDATE_INT, &cb);
+            config_update_task_wakeup = 1;
+            wake_up_interruptible(&config_update_wq);
+        }
+        else
+        {
+            RDMASetTargetLine(0, DISP_GetScreenHeight()*4/5);
+            cb.pFunc = _DISP_VSyncCallback;
+            DISP_SetInterruptCallback(DISP_DSI_VSYNC_INT, &cb);
+            cb.pFunc = _DISP_TargetLineCallback;
+            DISP_SetInterruptCallback(DISP_DSI_TARGET_LINE_INT, &cb);
+            cb.pFunc = _DISP_RegUpdateCallback;
+            DISP_SetInterruptCallback(DISP_DSI_REG_UPDATE_INT, &cb);
+            cb.pFunc = _DISP_HWDoneCallback;
+            DISP_SetInterruptCallback(DISP_DSI_VMDONE_INT, &cb);
+        }
+    }
+    else
+        DISP_LOG("DISP_InitVSYNC():unknown interface\n");
+#endif
+}
+
+void DISP_WaitVSYNC(void)
+{
+    MMProfileLog(MTKFB_MMP_Events.WaitVSync, MMProfileFlagStart);
+#ifndef MT65XX_NEW_DISP
+	if((LCM_TYPE_DBI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode == CMD_MODE)){
+    	LCD_WaitTE();
+	}
+	else if((LCM_TYPE_DPI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode != CMD_MODE)){
+		DPI_WaitVSYNC();
+	}
+	else
+	{
+	    DISP_LOG("DISP_WaitVSYNC():unknown interface\n");
+	}
+#else
+    if((LCM_TYPE_DBI == lcm_params->type))
+    {
+        LCD_WaitTE();
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode == CMD_MODE)
+    {
+//        DSI_WaitTE();
+        vsync_wq_flag = 0;
+        if (wait_event_interruptible_timeout(vsync_wq, vsync_wq_flag, HZ/10) == 0)
+        {
+            printk("[DISP] Wait VSync timeout. early_suspend=%d\n", is_early_suspended);
+        }
         
-        if(read_timeout_ms == 0)
-        {
-            DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Polling DSI VM done timeout!!!\n");
-            DSI_DumpRegisters();
-
-            DSI_Reset();
-            return 0;
-        }
     }
-	//DSI_REG->DSI_INTSTA.VM_DONE = 0;
-	OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,VM_DONE,0);
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " End polling DSI VM done ready!!!\n");
-#endif
-#endif
-	//read DriverIC and check ESD
-	result = lcm_drv->esd_check();
-	//restore video mode
-	if(!result)
-		OUTREG32(&DSI_REG->DSI_MODE_CTRL, AS_UINT32(&mode_ctl_backup));
-#endif
-	return result;
-}
-
-
-void DSI_set_int_TE(bool enable, unsigned int period)
-{
-#ifndef MT65XX_NEW_DISP
-	dsi_int_te_enabled = enable;
-	if(period<1)
-		period = 1;
-	dsi_int_te_period = period;
-	dsi_dpi_isr_count = 0;
-#endif
-}
-
-
-// called by DPI ISR.
-bool DSI_handle_int_TE(void)
-{
-#ifndef MT65XX_NEW_DISP
-	DSI_T0_INS t0;
-	long int dsi_current_time;
-
-	if (!DSI_REG->DSI_MODE_CTRL.MODE)
-		return false;
-
-	dsi_current_time = get_current_time_us();
-
-	if(DSI_REG->DSI_STATE_DBG3.TCON_STATE == DSI_VDO_VFP_STATE)
-	{
-		udelay(_dsiContext.vfp_period_us / 2);
-
-		if ((DSI_REG->DSI_STATE_DBG3.TCON_STATE == DSI_VDO_VFP_STATE) && DSI_REG->DSI_STATE_DBG0.CTL_STATE_0 == 0x1)
-		{			
-			// Can't do int. TE check while INUSE FB number is not 0 because later disable/enable DPI will set INUSE FB to number 0.
-			if(DPI_REG->STATUS.FB_INUSE != 0)
-				return false;
-			
-			DSI_clk_HS_mode(0);
-
-			//DSI_REG->DSI_COM_CTRL.DSI_RESET = 1;
-			OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,1);
-			DPI_DisableClk();
-			DSI_SetMode(CMD_MODE);
-			//DSI_REG->DSI_COM_CTRL.DSI_RESET = 0;
-			OUTREGBIT(DSI_COM_CTRL_REG,DSI_REG->DSI_COM_CTRL,DSI_RESET,0);
-			//DSI_Reset();
-
-			t0.CONFG = 0x20;		///TE
-			t0.Data0 = 0;
-			t0.Data_ID = 0;
-			t0.Data1 = 0;
-			
-			OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-
-			// Enable RD_RDY INT for polling it's status later
-			//DSI_REG->DSI_INTEN.RD_RDY =  1;
-			OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,RD_RDY,1);
-
-			DSI_EnableClk();
-
-	        while(DSI_REG->DSI_INTSTA.RD_RDY == 0)  // polling RD_RDY
-	        {
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vfp_period_us)
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for internal TE time-out for %d (us)!!!\n", _dsiContext.vfp_period_us);
-
-					///do necessary reset here
-					//DSI_REG->DSI_RACK.DSI_RACK = 1;
-					OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-					DSI_Reset();
-
-					return true;
-				}
-	        }
-
-			// Write clear RD_RDY
-			//DSI_REG->DSI_INTSTA.RD_RDY = 1;
-			//DSI_REG->DSI_RACK.DSI_RACK = 1;
-			OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,RD_RDY,1);
-			OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-			// Write clear CMD_DONE
-			//DSI_REG->DSI_INTSTA.CMD_DONE = 1;
-			OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,CMD_DONE,1);
-
-			// Restart video mode. (with VSA ahead)
-			DSI_SetMode(SYNC_PULSE_VDO_MODE);
-			DSI_clk_HS_mode(1);
-			DPI_EnableClk();
-			DSI_EnableClk();
-		}
-	
-	}
-#endif
-	return false;
-
-}
-
-
-void DSI_set_noncont_clk(bool enable, unsigned int period)
-{
-#ifndef MT65XX_NEW_DISP
-	dsi_noncont_clk_enabled = enable;
-	if(period<1)
-		period = 1;
-	dsi_noncont_clk_period = period;
-	dsi_dpi_isr_count = 0;
-#endif
-}
-
-
-// called by DPI ISR.
-void DSI_handle_noncont_clk(void)
-{
-#ifndef MT65XX_NEW_DISP
-	unsigned int state;
-	long int dsi_current_time;
-
-	if (!DSI_REG->DSI_MODE_CTRL.MODE)
-		return ;
-
-	state = DSI_REG->DSI_STATE_DBG3.TCON_STATE;
-
-	dsi_current_time = get_current_time_us();
-
-	switch(state)
-	{
-		case DSI_VDO_VSA_VS_STATE:
-			while(DSI_REG->DSI_STATE_DBG3.TCON_STATE != DSI_VDO_VSA_HS_STATE)
-			{
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vsa_vs_period_us)
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for %x state timeout %d (us)!!!\n", DSI_VDO_VSA_HS_STATE, _dsiContext.vsa_vs_period_us);
-					return ;
-				}			
-			}
-			break;
-
-		case DSI_VDO_VSA_HS_STATE:
-			while(DSI_REG->DSI_STATE_DBG3.TCON_STATE != DSI_VDO_VSA_VE_STATE)
-			{
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vsa_hs_period_us)
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for %x state timeout %d (us)!!!\n", DSI_VDO_VSA_VE_STATE, _dsiContext.vsa_hs_period_us);
-					return ;
-				}			
-			}
-			break;
-
-		case DSI_VDO_VSA_VE_STATE:
-			while(DSI_REG->DSI_STATE_DBG3.TCON_STATE != DSI_VDO_VBP_STATE)
-			{
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vsa_ve_period_us)
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for %x state timeout %d (us)!!!\n", DSI_VDO_VBP_STATE, _dsiContext.vsa_ve_period_us);
-					return ;
-				}			
-			}
-			break;
-
-		case DSI_VDO_VBP_STATE:
-			xlog_printk(ANDROID_LOG_WARN, "DSI", "Can't do clock switch in DSI_VDO_VBP_STATE !!!\n");
-			break;
-
-		case DSI_VDO_VACT_STATE:
-			while(DSI_REG->DSI_STATE_DBG3.TCON_STATE != DSI_VDO_VFP_STATE)
-			{
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vfp_period_us )
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for %x state timeout %d (us)!!!\n", DSI_VDO_VFP_STATE, _dsiContext.vfp_period_us );
-					return ;
-				}			
-			}
-			break;
-
-		case DSI_VDO_VFP_STATE:
-			while(DSI_REG->DSI_STATE_DBG3.TCON_STATE != DSI_VDO_VSA_VS_STATE)
-			{
-				if(get_current_time_us() - dsi_current_time > _dsiContext.vfp_period_us )
-				{
-					xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for %x state timeout %d (us)!!!\n", DSI_VDO_VSA_VS_STATE, _dsiContext.vfp_period_us );
-					return ;
-				}			
-			}
-			break;
-
-		default :
-			xlog_printk(ANDROID_LOG_ERROR, "DSI", "invalid state = %x \n", state);
-			return ;
-	}
-
-	// Clock switch HS->LP->HS
-	DSI_clk_HS_mode(0);
-	udelay(1);
-	DSI_clk_HS_mode(1);
-#endif
-}
-#endif
-
-#ifdef ENABLE_DSI_ERROR_REPORT
-static unsigned int _dsi_cmd_queue[32];
-#endif
-void DSI_set_cmdq_V2(unsigned cmd, unsigned char count, unsigned char *para_list, unsigned char force_update)
-{
-	UINT32 i, layer, layer_state, lane_num;
-	UINT32 goto_addr, mask_para, set_para;
-	UINT32 fbPhysAddr, fbVirAddr;
-	DSI_T0_INS t0;	
-	DSI_T1_INS t1;	
-	DSI_T2_INS t2;	
-#ifdef ENABLE_DSI_ERROR_REPORT
-    if ((para_list[0] & 1))
+    else if((LCM_TYPE_DPI == lcm_params->type) || 
+        (LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode != CMD_MODE))
     {
-		memset(_dsi_cmd_queue, 0, sizeof(_dsi_cmd_queue));
-		memcpy(_dsi_cmd_queue, para_list, count);
-		_dsi_cmd_queue[(count+3)/4*4] = 0x4;
-		count = (count+3)/4*4 + 4;
-		para_list = (unsigned char*) _dsi_cmd_queue;
+        //printk("[DISP] +VSync\n");
+        vsync_wq_flag = 0;
+        if (wait_event_interruptible_timeout(vsync_wq, vsync_wq_flag, HZ/10) == 0)
+        {
+            printk("[DISP] Wait VSync timeout. early_suspend=%d\n", is_early_suspended);
+        }
+        //printk("[DISP] -VSync\n");
     }
     else
     {
-		para_list[0] |= 4;
+        DISP_LOG("DISP_WaitVSYNC():unknown interface\n");
     }
 #endif
-    _WaitForEngineNotBusy();
-#if 0    
-	if (count > 59)
-	{
-		UINT32 pixel = count/3 + ((count%3) ? 1 : 0);
-		
-		LCD_REG_LAYER 	fb_layer_info;
-		LCD_REG_DSI_DC	dsi_info;
+    MMProfileLog(MTKFB_MMP_Events.WaitVSync, MMProfileFlagEnd);
+}
 
-		// backup layer state.
-		layer_state = AS_UINT32(&LCD_REG->WROI_CONTROL) & 0xFC000000;
-
-		// backup FB layer info.
-		memcpy((void *)&fb_layer_info, (void *)&LCD_REG->LAYER[FB_LAYER], sizeof(LCD_REG_LAYER));
-
-		// backup LCD-DSI I/F configuration.
-		dsi_info = LCD_REG->DS_DSI_CON;
-
-		// backup lane number.
-		lane_num = DSI_REG->DSI_TXRX_CTRL.LANE_NUM;
-
-		// HW limitation.
-		// LP type-1 command can't go with 2 lanes. So we must switch to lane mode.
-		DSI_REG->DSI_TXRX_CTRL.LANE_NUM = 1;
-		DSI_PHY_REG->MIPITX_CON1.RG_DSI_CK_SEL = 0;
-
-		// Modify LCD-DSI configuration
-		LCD_REG->DS_DSI_CON.DC_DSI = TRUE;
-		// Let LSB of RGB(BGR in buffer) first.
-		LCD_REG->DS_DSI_CON.RGB_SWAP = LCD_DSI_IF_FMT_COLOR_ORDER_BGR;
-		// Let parameters be in unit of byte.
-		LCD_REG->DS_DSI_CON.CLR_FMT = LCD_DSI_IF_FORMAT_RGB888;
-		// HW limitation
-		// It makes package numbers > 1.
-		LCD_REG->DS_DSI_CON.PACKET_SIZE = 30;
-
-		// Start of Enable only one layer (FB layer) to push data to DSI
-		LCD_CHECK_RET(LCD_LayerEnable(LCD_LAYER_ALL, FALSE));
-		LCD_CHECK_RET(LCD_LayerEnable(FB_LAYER, TRUE));
-		LCD_CHECK_RET(LCD_SetRoiWindow(0, 0, pixel, 1));
-		LCD_CHECK_RET(LCD_SetBackgroundColor(0));
-                
-		// operates on FB layer
-		{
-		    extern void disp_get_fb_address(UINT32 *fbVirAddr, UINT32 *fbPhysAddr);
-            disp_get_fb_address(&fbVirAddr ,&fbPhysAddr);
-
-		    // copy parameters to FB layer buffer.
-		    memcpy((void *)fbVirAddr, (void *)para_list, count);
-		    LCD_REG->LAYER[FB_LAYER].ADDRESS = fbPhysAddr;
-		}
-
-		LCD_CHECK_RET(LCD_LayerSetFormat(FB_LAYER, LCD_LAYER_FORMAT_RGB888));
-		LCD_CHECK_RET(LCD_LayerSetPitch(FB_LAYER, pixel*3));
-		LCD_CHECK_RET(LCD_LayerSetOffset(FB_LAYER, 0, 0));
-		LCD_CHECK_RET(LCD_LayerSetSize(FB_LAYER, pixel, 1));
-		// End of Enable only one layer (FB layer) to push data to DSI
-
-		t1.CONFG = 1;
-		t1.Data_ID = DSI_DCS_LONG_PACKET_ID;
-		t1.mem_start0 = (cmd&0xFF);
-		t1.mem_start1 = (cmd>>8);
-
-		OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t1));
-		OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);	
-
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - DSI_set_cmdq_V2. command(0x%x) parameter count = %d > 59, pixel = %d \n", cmd, count, pixel);
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - command queue only support 16 x 4 bytes. Header used 4 byte. DCS used 1 byte. If parameter > 59 byte, work around by Type-1 command. \n");
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "para_list[%d] = {", count);
-	    for (i = 0; i < count; i++)
-	        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "0x%02x, ", para_list[i]);
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "} \n");
-
-#if defined(MTK_M4U_SUPPORT)
-		LCD_M4U_On(0);
-#endif
-		if(force_update)
-		{
-			LCD_CHECK_RET(LCD_StartTransfer(FALSE));		
-			DSI_EnableClk();
-		}
-
-		_WaitForEngineNotBusy();
-#if defined(MTK_M4U_SUPPORT)
-		LCD_M4U_On(1);
-#endif
-		// restore FB layer info.
-		memcpy((void *)&LCD_REG->LAYER[FB_LAYER], (void *)&fb_layer_info, sizeof(LCD_REG_LAYER));
-
-		// restore LCD-DSI I/F configuration.
-		LCD_REG->DS_DSI_CON = dsi_info;
-
-		// restore lane number.
-		DSI_REG->DSI_TXRX_CTRL.LANE_NUM = lane_num;
-		DSI_PHY_REG->MIPITX_CON1.RG_DSI_CK_SEL = (lane_num - 1);
-		
-		// restore layer state.
-		for(layer=LCD_LAYER_0; layer<LCD_LAYER_NUM; layer++)
-		{
-			if(layer_state&(0x80000000>>layer))
-				LCD_CHECK_RET(LCD_LayerEnable(layer, TRUE));
-			else
-				LCD_CHECK_RET(LCD_LayerEnable(layer, FALSE));
-		}
-		
+DISP_STATUS DISP_PauseVsync(BOOL enable)
+{
+	if((LCM_TYPE_DBI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode == CMD_MODE)){
+        if (enable)
+            hrtimer_cancel(&cmd_mode_update_timer);
+    	LCD_PauseVSYNC(enable);
 	}
-	else
-#endif
-	{
-	if (cmd < 0xB0)
-	{
-		if (count > 1)
-		{
-			t2.CONFG = 2;
-			t2.Data_ID = DSI_DCS_LONG_PACKET_ID;
-			t2.WC16 = count+1;
-
-			OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t2));
-
-			goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte0);
-			mask_para = (0xFF<<((goto_addr&0x3)*8));
-			set_para = (cmd<<((goto_addr&0x3)*8));
-			MASKREG32(goto_addr&(~0x3), mask_para, set_para);
-			
-			for(i=0; i<count; i++)
-			{
-				goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte1) + i;
-				mask_para = (0xFF<<((goto_addr&0x3)*8));
-				set_para = (para_list[i]<<((goto_addr&0x3)*8));
-				MASKREG32(goto_addr&(~0x3), mask_para, set_para);			
-			}
-
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 2+(count)/4); 		
-		}
-		else
-		{
-			t0.CONFG = 0;
-			t0.Data0 = cmd;
-			if (count)
-			{
-				t0.Data_ID = DSI_DCS_SHORT_PACKET_ID_1;
-				t0.Data1 = para_list[0];
-			}
-			else
-			{
-				t0.Data_ID = DSI_DCS_SHORT_PACKET_ID_0;
-				t0.Data1 = 0;
-			}
-			OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-		}
+	else if((LCM_TYPE_DPI == lcm_params->type) || 
+	(LCM_TYPE_DSI == lcm_params->type && lcm_params->dsi.mode != CMD_MODE)){
+		DPI_PauseVSYNC(enable);
 	}
 	else
 	{
-		if (count > 1)
-		{
-			t2.CONFG = 2;
-			t2.Data_ID = DSI_GERNERIC_LONG_PACKET_ID;
-			t2.WC16 = count+1;
-
-			OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t2));
-
-			goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte0);
-			mask_para = (0xFF<<((goto_addr&0x3)*8));
-			set_para = (cmd<<((goto_addr&0x3)*8));
-			MASKREG32(goto_addr&(~0x3), mask_para, set_para);
-			
-			for(i=0; i<count; i++)
-			{
-				goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte1) + i;
-				mask_para = (0xFF<<((goto_addr&0x3)*8));
-				set_para = (para_list[i]<<((goto_addr&0x3)*8));
-				MASKREG32(goto_addr&(~0x3), mask_para, set_para);			
-			}
-
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 2+(count)/4);
-
-		}
-		else
-		{
-			t0.CONFG = 0;
-			t0.Data0 = cmd;
-			if (count)
-			{
-				t0.Data_ID = DSI_GERNERIC_SHORT_PACKET_ID_2;
-				t0.Data1 = para_list[0];
-			}
-			else
-			{
-				t0.Data_ID = DSI_GERNERIC_SHORT_PACKET_ID_1;
-				t0.Data1 = 0;
-			}
-			OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-		}
+	    DISP_LOG("DISP_PauseVSYNC():unknown interface\n");
 	}
-		
-//	for (i = 0; i < AS_UINT32(&DSI_REG->DSI_CMDQ_SIZE); i++)
-//        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI_set_cmdq_V2. DSI_CMDQ+%04x : 0x%08x\n", i*4, INREG32(DSI_BASE + 0x180 + i*4));
-
-		if(force_update)
-        {
-            MMProfileLogEx(MTKFB_MMP_Events.DSICmd, MMProfileFlagStart, *(unsigned int*)(&DSI_CMDQ_REG->data[0]), *(unsigned int*)(&DSI_CMDQ_REG->data[1]));
-            DSI_EnableClk();
-            for(i=0; i<10; i++) ;
-            _WaitForEngineNotBusy();
-            MMProfileLogEx(MTKFB_MMP_Events.DSICmd, MMProfileFlagEnd, *(unsigned int*)(&DSI_CMDQ_REG->data[2]), *(unsigned int*)(&DSI_CMDQ_REG->data[3]));
-        }
-	}
-
+	return DISP_STATUS_OK;
 }
 
-void DSI_set_cmdq_V3(LCM_setting_table_V3 *para_tbl, unsigned int size, unsigned char force_update)
+DISP_STATUS DISP_ConfigDither(int lrs, int lgs, int lbs, int dbr, int dbg, int dbb)
 {
-	UINT32 i, layer, layer_state, lane_num;
-	UINT32 goto_addr, mask_para, set_para;
-	UINT32 fbPhysAddr, fbVirAddr;
-	DSI_T0_INS t0;	
-	DSI_T1_INS t1;	
-	DSI_T2_INS t2;	
+    DISP_LOG("DISP_ConfigDither lrs:0x%x, lgs:0x%x, lbs:0x%x, dbr:0x%x, dbg:0x%x, dbb:0x%x \n", lrs, lgs, lbs, dbr, dbg, dbb);
 
-	UINT32 index = 0;
-
-	unsigned char data_id, cmd, count;
-	unsigned char *para_list;
-
-	do {
-		data_id = para_tbl[index].id;
-		cmd = para_tbl[index].cmd;
-		count = para_tbl[index].count;
-		para_list = para_tbl[index].para_list;
-
-		if (data_id == REGFLAG_ESCAPE_ID && cmd == REGFLAG_DELAY_MS_V3)
-		{
-			udelay(1000*count);
-			DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI_set_cmdq_V3[%d]. Delay %d (ms) \n", index, count);
-
-			continue;
-		}
-
-		_WaitForEngineNotBusy();
-#if 0		
-		if (count > 59)
-		{
-			UINT32 pixel = count/3 + ((count%3) ? 1 : 0);
-			
-			LCD_REG_LAYER	fb_layer_info;
-			LCD_REG_DSI_DC	dsi_info;
-			bool			lcd_w2m, lcm_te_enable;
-
-			// backup layer state.
-			layer_state = AS_UINT32(&LCD_REG->WROI_CONTROL) & 0xFC000000;
-
-			// backup FB layer info.
-			memcpy((void *)&fb_layer_info, (void *)&LCD_REG->LAYER[FB_LAYER], sizeof(LCD_REG_LAYER));
-
-			// backup LCD-DSI I/F configuration.
-			dsi_info = LCD_REG->DS_DSI_CON;
-
-			// backup lane number.
-			lane_num = DSI_REG->DSI_TXRX_CTRL.LANE_NUM;
-
-			// backup lcd_w2m
-			lcd_w2m = LCD_REG->WROI_CONTROL.W2M;
-
-			// backup TE enable
-			lcm_te_enable = LCD_REG->TEARING_CFG.ENABLE;
-
-			// HW limitation.
-			// LP type-1 command can't go with 2 lanes. So we must switch to lane mode.
-			DSI_REG->DSI_TXRX_CTRL.LANE_NUM = 1;
-			DSI_PHY_REG->MIPITX_CON1.RG_DSI_CK_SEL = 0;
-
-			// Modify LCD-DSI configuration
-			LCD_REG->DS_DSI_CON.DC_DSI = TRUE;
-			// Let LSB of RGB(BGR in buffer) first.
-			LCD_REG->DS_DSI_CON.RGB_SWAP = LCD_DSI_IF_FMT_COLOR_ORDER_BGR;
-			// Let parameters be in unit of byte.
-			LCD_REG->DS_DSI_CON.CLR_FMT = LCD_DSI_IF_FORMAT_RGB888;
-			// Disable W2M
-			LCD_REG->WROI_CONTROL.W2M = 0;
-
-			// HW limitation
-			// It makes package numbers > 1.
-			LCD_REG->DS_DSI_CON.PACKET_SIZE = 256;
-
-			// Disable TE
-			LCD_TE_Enable(0);
-
-			// Start of Enable only one layer (FB layer) to push data to DSI
-			LCD_CHECK_RET(LCD_LayerEnable(LCD_LAYER_ALL, FALSE));
-			LCD_CHECK_RET(LCD_LayerEnable(FB_LAYER, TRUE));
-			LCD_CHECK_RET(LCD_SetRoiWindow(0, 0, pixel, 1));
-			LCD_CHECK_RET(LCD_SetBackgroundColor(0));
-#ifdef BUILD_UBOOT
-			LCD_REG->LAYER[FB_LAYER].ADDRESS = para_list;
-#else      
-			// operates on FB layer
-			{
-				extern void disp_get_fb_address(UINT32 *fbVirAddr, UINT32 *fbPhysAddr);
-				disp_get_fb_address(&fbVirAddr ,&fbPhysAddr);
-
-				// copy parameters to FB layer buffer.
-				memcpy((void *)fbVirAddr, (void *)para_list, count);
-				//LCD_REG->LAYER[FB_LAYER].ADDRESS = fbPhysAddr;
-			}
-#endif
-			LCD_CHECK_RET(LCD_LayerSetFormat(FB_LAYER, LCD_LAYER_FORMAT_RGB888));
-			LCD_CHECK_RET(LCD_LayerSetPitch(FB_LAYER, pixel*3));
-			LCD_CHECK_RET(LCD_LayerSetOffset(FB_LAYER, 0, 0));
-			LCD_CHECK_RET(LCD_LayerSetSize(FB_LAYER, pixel, 1));
-			// End of Enable only one layer (FB layer) to push data to DSI
-
-			t1.CONFG = 1;
-			t1.Data_ID = data_id;	
-			t1.mem_start0 = (cmd&0xFF);
-			t1.mem_start1 = (cmd>>8);
-
-			OUTREG32(&DSI_CMDQ_REG->data0[0], AS_UINT32(&t1));
-			OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);	
-
-			DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - DSI_set_cmdq_V3[%d]. command(0x%x) parameter count = %d > 59, pixel = %d \n", index, cmd, count, pixel);
-			DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[DISP] - kernel - command queue only support 16 x 4 bytes. Header used 4 byte. DCS used 1 byte. If parameter > 59 byte, work around by Type-1 command. \n");
-			DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "para_list[%d] = {", count);
-			for (i = 0; i < count; i++)
-				DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "0x%02x, ", para_list[i]);
-			DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "} \n");
-
-#ifdef BUILD_UBOOT
-			if(force_update)
-			{
-				LCD_CHECK_RET(LCD_StartTransfer(FALSE));
-				DSI_EnableClk();
-
-				while(DSI_REG->DSI_STA.BUSY || DSI_REG->DSI_STATE_DBG4.EXE_STATE != 1) {
-					printk("[DISP - uboot - DSI Busy : %d, DSI_STATE_DBG4.EXE_STATE = %d, LCD Busy : %d \n", DSI_REG->DSI_STA.BUSY, DSI_REG->DSI_STATE_DBG4.EXE_STATE, LCD_REG->STATUS.BUSY);
-					if (DSI_REG->DSI_STATE_DBG4.EXE_STATE == 2 && !LCD_REG->STATUS.BUSY) {
-						DSI_Reset();
-					}				
-				}
-								
-			}
-#else      
-			//LCD_M4U_On(0);
-
-			if(force_update)
-			{
-				LCD_CHECK_RET(LCD_StartTransfer(FALSE));		
-				DSI_EnableClk();
-
-				while (_IsEngineBusy())
-				{
-					long ret = wait_event_interruptible_timeout(_dsi_wait_queue, 
-																!_IsEngineBusy(),
-																1 * HZ);
-					if (0 == ret) {
-						DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", "[%s] Wait for DSI engine not busy timeout!!! Busy : %d, DSI_STATE_DBG4.EXE_STATE = %d \n", __func__, DSI_REG->DSI_STA.BUSY, DSI_REG->DSI_STATE_DBG4.EXE_STATE);
-						if (DSI_REG->DSI_STATE_DBG4.EXE_STATE == 2) {
-							DSI_Reset();
-						}
-					}
-				}
-			}
-
-			//LCD_M4U_On(1);
-#endif
-			// restore FB layer info.
-			memcpy((void *)&LCD_REG->LAYER[FB_LAYER], (void *)&fb_layer_info, sizeof(LCD_REG_LAYER));
-
-			// restore LCD-DSI I/F configuration.
-			LCD_REG->DS_DSI_CON = dsi_info;
-
-			// restore lane number.
-			DSI_REG->DSI_TXRX_CTRL.LANE_NUM = lane_num;
-			DSI_PHY_REG->MIPITX_CON1.RG_DSI_CK_SEL = (lane_num - 1);
-			
-			// restore layer state.
-			for(layer=LCD_LAYER_0; layer<LCD_LAYER_NUM; layer++)
-			{
-				if(layer_state&(0x80000000>>layer))
-					LCD_CHECK_RET(LCD_LayerEnable(layer, TRUE));
-				else
-					LCD_CHECK_RET(LCD_LayerEnable(layer, FALSE));
-			}
-
-			// restore lcd_w2m
-			if (lcd_w2m)
-				LCD_REG->WROI_CONTROL.W2M = 1;
-
-			// restore TE
-			if(lcm_te_enable)
-				LCD_TE_Enable(1);
-
-		}
-		else
-#endif
-		{
-			//for(i = 0; i < sizeof(DSI_CMDQ_REG->data0) / sizeof(DSI_CMDQ); i++)
-			//	OUTREG32(&DSI_CMDQ_REG->data0[i], 0);
-			//memset(&DSI_CMDQ_REG->data[0], 0, sizeof(DSI_CMDQ_REG->data[0]));
-			OUTREG32(&DSI_CMDQ_REG->data[0], 0);
-		
-			if (count > 1)
-			{
-				t2.CONFG = 2;
-				t2.Data_ID = data_id;
-				t2.WC16 = count+1;
-
-				OUTREG32(&DSI_CMDQ_REG->data[0].byte0, AS_UINT32(&t2));
-
-				goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte0);
-				mask_para = (0xFF<<((goto_addr&0x3)*8));
-				set_para = (cmd<<((goto_addr&0x3)*8));
-				MASKREG32(goto_addr&(~0x3), mask_para, set_para);
-				
-				for(i=0; i<count; i++)
-				{
-					goto_addr = (UINT32)(&DSI_CMDQ_REG->data[1].byte1) + i;
-					mask_para = (0xFF<<((goto_addr&0x3)*8));
-					set_para = (para_list[i]<<((goto_addr&0x3)*8));
-					MASKREG32(goto_addr&(~0x3), mask_para, set_para);			
-				}
-
-				OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 2+(count)/4); 		
-			}
-			else
-			{
-				t0.CONFG = 0;
-				t0.Data0 = cmd;
-				if (count)
-				{
-					t0.Data_ID = data_id;
-					t0.Data1 = para_list[0];
-				}
-				else
-				{
-					t0.Data_ID = data_id;
-					t0.Data1 = 0;
-				}
-				OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-				OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-			}
-			
-			for (i = 0; i < AS_UINT32(&DSI_REG->DSI_CMDQ_SIZE); i++)
-				DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI_set_cmdq_V3[%d]. DSI_CMDQ+%04x : 0x%08x\n", index, i*4, INREG32(DSI_BASE + 0x180 + i*4));
-
-			if(force_update)
-            {
-                MMProfileLog(MTKFB_MMP_Events.DSICmd, MMProfileFlagStart);
-                DSI_EnableClk();
-                for(i=0; i<10; i++) ;
-                _WaitForEngineNotBusy();
-                MMProfileLog(MTKFB_MMP_Events.DSICmd, MMProfileFlagEnd);
-            }
-		}
-
-	} while (++index < size);
-
-}
-
-void DSI_set_cmdq(unsigned int *pdata, unsigned int queue_size, unsigned char force_update)
-{
-	UINT32 i;
-
-	ASSERT(queue_size<=16);
-
-    _WaitForEngineNotBusy();
-#ifdef ENABLE_DSI_ERROR_REPORT
-    if ((pdata[0] & 1))
+    if(LCD_STATUS_OK == LCD_ConfigDither(lrs, lgs, lbs, dbr, dbg, dbb))
     {
-		memcpy(_dsi_cmd_queue, pdata, queue_size*4);
-		_dsi_cmd_queue[queue_size++] = 0x4;
-		pdata = (unsigned int*) _dsi_cmd_queue;
+        return DISP_STATUS_OK;
     }
     else
     {
-		pdata[0] |= 4;
-    }
-#endif
-
-	for(i=0; i<queue_size; i++)
-		OUTREG32(&DSI_CMDQ_REG->data[i], AS_UINT32((pdata+i)));
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, queue_size);
-
-//    for (i = 0; i < queue_size; i++)
-//        printk("[DISP] - kernel - DSI_set_cmdq. DSI_CMDQ+%04x : 0x%08x\n", i*4, INREG32(DSI_BASE + 0x180 + i*4));
-
-	if(force_update)
-    {
-        MMProfileLogEx(MTKFB_MMP_Events.DSICmd, MMProfileFlagStart, *(unsigned int*)(&DSI_CMDQ_REG->data[0]), *(unsigned int*)(&DSI_CMDQ_REG->data[1]));
-		DSI_EnableClk();
-        for(i=0; i<10; i++) ;
-        _WaitForEngineNotBusy();
-        MMProfileLogEx(MTKFB_MMP_Events.DSICmd, MMProfileFlagEnd, *(unsigned int*)(&DSI_CMDQ_REG->data[2]), *(unsigned int*)(&DSI_CMDQ_REG->data[3]));
+		DISP_LOG("DISP_ConfigDither error \n");
+        return DISP_STATUS_ERROR;
     }
 }
 
 
-DSI_STATUS DSI_Write_T0_INS(DSI_T0_INS *t0)
+// ---------------------------------------------------------------------------
+//  Retrieve Information
+// ---------------------------------------------------------------------------
+
+BOOL DISP_IsVideoMode(void)
 {
-    OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(t0));	
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-	OUTREG32(&DSI_REG->DSI_START, 0);
-	OUTREG32(&DSI_REG->DSI_START, 1);
-
-	return DSI_STATUS_OK;	
-}
-
-
-DSI_STATUS DSI_Write_T1_INS(DSI_T1_INS *t1)
-{
-    OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(t1));	
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-	OUTREG32(&DSI_REG->DSI_START, 0);
-	OUTREG32(&DSI_REG->DSI_START, 1);
-
-	return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_Write_T2_INS(DSI_T2_INS *t2)
-{
-	unsigned int i;
-	
-	OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(t2));
-
-	for(i=0;i<((t2->WC16-1)>>2)+1;i++)
-	    OUTREG32(&DSI_CMDQ_REG->data[1+i], AS_UINT32((t2->pdata+i)));
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, (((t2->WC16-1)>>2)+2));
-	OUTREG32(&DSI_REG->DSI_START, 0);
-	OUTREG32(&DSI_REG->DSI_START, 1);
-
-	return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_Write_T3_INS(DSI_T3_INS *t3)
-{
-    OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(t3));	
-
-	OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-	OUTREG32(&DSI_REG->DSI_START, 0);
-	OUTREG32(&DSI_REG->DSI_START, 1);
-
-	return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_TXRX_Control(bool cksm_en, 
-                                  bool ecc_en, 
-                                  unsigned char lane_num, 
-                                  unsigned char vc_num,
-                                  bool null_packet_en,
-                                  bool err_correction_en,
-                                  bool dis_eotp_en,
-                                  unsigned int  max_return_size)
-{
-    DSI_TXRX_CTRL_REG tmp_reg;
-    
-    tmp_reg=DSI_REG->DSI_TXRX_CTRL;
-
-    ///TODO: parameter checking
-//    tmp_reg.CKSM_EN=cksm_en;
-//    tmp_reg.ECC_EN=ecc_en;
-	switch(lane_num)
-	{
-		case LCM_ONE_LANE:tmp_reg.LANE_NUM = 1;break;
-		case LCM_TWO_LANE:tmp_reg.LANE_NUM = 3;break;
-		case LCM_THREE_LANE:tmp_reg.LANE_NUM = 0x7;break;
-		case LCM_FOUR_LANE:tmp_reg.LANE_NUM = 0xF;break;
-	}	
-    tmp_reg.VC_NUM=vc_num;
-//    tmp_reg.CORR_EN = err_correction_en;
-    tmp_reg.DIS_EOT = dis_eotp_en;
-    tmp_reg.NULL_EN = null_packet_en;
-    tmp_reg.MAX_RTN_SIZE = max_return_size;
-	tmp_reg.HSTX_CKLP_EN = 1;//need customization???
-    OUTREG32(&DSI_REG->DSI_TXRX_CTRL, AS_UINT32(&tmp_reg));
-
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_PS_Control(unsigned int ps_type, unsigned int vact_line, unsigned int ps_wc)
-{
-    DSI_PSCTRL_REG tmp_reg;
-	UINT32 tmp_hstx_cklp_wc;
-    tmp_reg=DSI_REG->DSI_PSCTRL;
-    
-    ///TODO: parameter checking
-    ASSERT(ps_type <= PACKED_PS_18BIT_RGB666);
-	if(ps_type>LOOSELY_PS_18BIT_RGB666)
-    	tmp_reg.DSI_PS_SEL=(5 - ps_type);
-	else
-		tmp_reg.DSI_PS_SEL=ps_type;
-    tmp_reg.DSI_PS_WC=ps_wc;
-    tmp_hstx_cklp_wc = ps_wc;
-
-	OUTREG32(&DSI_REG->DSI_VACT_NL, AS_UINT32(&vact_line));
-    OUTREG32(&DSI_REG->DSI_PSCTRL, AS_UINT32(&tmp_reg));   
-	OUTREG32(&DSI_REG->DSI_HSTX_CKL_WC, tmp_hstx_cklp_wc);
-    return DSI_STATUS_OK;
-}
-
-
-DSI_STATUS DSI_ConfigVDOTiming(unsigned int dsi_vsa_nl,
-                                    unsigned int dsi_vbp_nl,
-                                    unsigned int dsi_vfp_nl,
-                                    unsigned int dsi_vact_nl,
-                                    unsigned int dsi_line_nb,
-                                    unsigned int dsi_hsa_nb,
-                                    unsigned int dsi_hbp_nb,
-                                    unsigned int dsi_hfp_nb,
-                                    unsigned int dsi_rgb_nb,
-                                    unsigned int dsi_hsa_wc,
-                                    unsigned int dsi_hbp_wc,
-                                    unsigned int dsi_hfp_wc)
-{
-    ///TODO: parameter checking
-	OUTREG32(&DSI_REG->DSI_VSA_NL, AS_UINT32(&dsi_vsa_nl));
-	OUTREG32(&DSI_REG->DSI_VBP_NL, AS_UINT32(&dsi_vbp_nl));
-	OUTREG32(&DSI_REG->DSI_VFP_NL, AS_UINT32(&dsi_vfp_nl));
-	OUTREG32(&DSI_REG->DSI_VACT_NL, AS_UINT32(&dsi_vact_nl));
-#if 0 //6583 not need these parameters
-	OUTREG32(&DSI_REG->DSI_LINE_NB, AS_UINT32(&dsi_line_nb));
-	OUTREG32(&DSI_REG->DSI_HSA_NB, AS_UINT32(&dsi_hsa_nb));
-	OUTREG32(&DSI_REG->DSI_HBP_NB, AS_UINT32(&dsi_hbp_nb));
-	OUTREG32(&DSI_REG->DSI_HFP_NB, AS_UINT32(&dsi_hfp_nb));
-	OUTREG32(&DSI_REG->DSI_RGB_NB, AS_UINT32(&dsi_rgb_nb));
-#endif
-	OUTREG32(&DSI_REG->DSI_HSA_WC, AS_UINT32(&dsi_hsa_wc));
-	OUTREG32(&DSI_REG->DSI_HBP_WC, AS_UINT32(&dsi_hbp_wc));
-	OUTREG32(&DSI_REG->DSI_HFP_WC, AS_UINT32(&dsi_hfp_wc));	
-
-    return DSI_STATUS_OK;
-}
-
-void DSI_write_lcm_cmd(unsigned int cmd)
-{
-	DSI_T0_INS *t0_tmp=0;
-	DSI_CMDQ_CONFG CONFG_tmp;
-
-	CONFG_tmp.type=SHORT_PACKET_RW;
-	CONFG_tmp.BTA=DISABLE_BTA;
-	CONFG_tmp.HS=LOW_POWER;
-	CONFG_tmp.CL=CL_8BITS;
-	CONFG_tmp.TE=DISABLE_TE;
-	CONFG_tmp.RPT=DISABLE_RPT;
-
-	t0_tmp->CONFG = *((unsigned char *)(&CONFG_tmp));
-	t0_tmp->Data_ID= (cmd&0xFF);
-	t0_tmp->Data0 = 0x0;
-	t0_tmp->Data1 = 0x0;	
-
-	DSI_Write_T0_INS(t0_tmp);
-}
-
-
-void DSI_write_lcm_regs(unsigned int addr, unsigned int *para, unsigned int nums)
-{
-	DSI_T2_INS *t2_tmp=0;
-	DSI_CMDQ_CONFG CONFG_tmp;
-
-	CONFG_tmp.type=LONG_PACKET_W;
-	CONFG_tmp.BTA=DISABLE_BTA;
-	CONFG_tmp.HS=LOW_POWER;
-	CONFG_tmp.CL=CL_8BITS;
-	CONFG_tmp.TE=DISABLE_TE;
-	CONFG_tmp.RPT=DISABLE_RPT;
-
-	t2_tmp->CONFG = *((unsigned char *)(&CONFG_tmp));
-	t2_tmp->Data_ID = (addr&0xFF);
-	t2_tmp->WC16 = nums;	
-	t2_tmp->pdata = para;	
-
-	DSI_Write_T2_INS(t2_tmp);
-
-}
-
-UINT32 DSI_dcs_read_lcm_reg(UINT8 cmd)
-{
-    UINT32 max_try_count = 5;
-    UINT32 recv_data;
-    UINT32 recv_data_cnt;
-    unsigned int read_timeout_ms;
-    unsigned char packet_type;
-#if 0
-    DSI_T0_INS t0;  
-#if ENABLE_DSI_INTERRUPT
-    static const long WAIT_TIMEOUT = 2 * HZ;    // 2 sec
-    long ret;
-#endif
-
-	if (DSI_REG->DSI_MODE_CTRL.MODE)
-		return 0;
-
-    do
+    disp_drv_init_context();
+    if(lcm_params)
+        return lcm_params->type==LCM_TYPE_DPI || (lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE);
+    else
     {
-       if(max_try_count == 0)
-          return 0;
-
-       max_try_count--;
-       recv_data = 0;
-       recv_data_cnt = 0;
-       read_timeout_ms = 20;
-        
-       _WaitForEngineNotBusy();
-
-       t0.CONFG = 0x04;        ///BTA
-       t0.Data0 = cmd;
-       t0.Data_ID = DSI_DCS_READ_PACKET_ID;
-       t0.Data1 = 0;
-
-       OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-       OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-
-       ///clear read ACK 
-       DSI_REG->DSI_RACK.DSI_RACK = 1;
-       DSI_REG->DSI_INTSTA.RD_RDY = 1;
-       DSI_REG->DSI_INTSTA.CMD_DONE = 1;
-       DSI_REG->DSI_INTEN.RD_RDY =  1;
-       DSI_REG->DSI_INTEN.CMD_DONE=  1;
-
-       OUTREG32(&DSI_REG->DSI_START, 0);
-       OUTREG32(&DSI_REG->DSI_START, 1);
-
-       /// the following code is to
-       /// 1: wait read ready
-       /// 2: ack read ready
-       /// 3: wait for CMDQ_DONE
-       /// 3: read data
-#if ENABLE_DSI_INTERRUPT
-        ret = wait_event_interruptible_timeout(_dsi_dcs_read_wait_queue, 
-                                                       !_IsEngineBusy(),
-                                                       WAIT_TIMEOUT);
-        if (0 == ret) {
-            DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " Wait for DSI engine read ready timeout!!!\n");
-
-				DSI_DumpRegisters();
-				
-				///do necessary reset here
-				DSI_REG->DSI_RACK.DSI_RACK = 1;
-				DSI_Reset();
-
-                return 0;
-            }
-#else
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Start polling DSI read ready!!!\n");
-    #endif
-        while(DSI_REG->DSI_INTSTA.RD_RDY == 0)  ///read clear
-        {
-            ///keep polling
-            msleep(1);
-            read_timeout_ms --;
-            
-            if(read_timeout_ms == 0)
-            {
-                DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Polling DSI read ready timeout!!!\n");
-                DSI_DumpRegisters();
-
-                ///do necessary reset here
-                DSI_REG->DSI_RACK.DSI_RACK = 1;
-                DSI_Reset();
-                return 0;
-            }
-        }
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " End polling DSI read ready!!!\n");
-    #endif
-
-        DSI_REG->DSI_RACK.DSI_RACK = 1;
-
-       while(DSI_REG->DSI_STA.BUF_UNDERRUN || DSI_REG->DSI_STA.ESC_ENTRY_ERR || DSI_REG->DSI_STA.LPDT_SYNC_ERR || DSI_REG->DSI_STA.CTRL_ERR || DSI_REG->DSI_STA.CONTENT_ERR)
-       {
-           ///DSI READ ACK HW bug workaround
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-           DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI is busy: 0x%x !!!\n", DSI_REG->DSI_STA.BUSY);
-    #endif
-           DSI_REG->DSI_RACK.DSI_RACK = 1;
-       }
-
-
-       ///clear interrupt status
-       DSI_REG->DSI_INTSTA.RD_RDY = 1;
-       ///STOP DSI
-       OUTREG32(&DSI_REG->DSI_START, 0);
-
-#endif
-   
-       DSI_REG->DSI_INTEN.RD_RDY =  0;
-
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_STA : 0x%x \n", DSI_REG->DSI_RX_STA);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_SIZE : 0x%x \n", DSI_REG->DSI_CMDQ_SIZE.CMDQ_SIZE);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA0 : 0x%x \n", DSI_CMDQ_REG->data[0].byte0);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA1 : 0x%x \n", DSI_CMDQ_REG->data[0].byte1);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA2 : 0x%x \n", DSI_CMDQ_REG->data[0].byte2);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA3 : 0x%x \n", DSI_CMDQ_REG->data[0].byte3);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE0 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE0);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE1 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE1);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE2 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE2);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE3 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE3);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE4 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE4);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE5 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE5);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE6 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE6);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA.BYTE7 : 0x%x \n", DSI_REG->DSI_RX_DATA.BYTE7);
-    #endif
-       packet_type = DSI_REG->DSI_RX_DATA.BYTE0;
-           
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI read packet_type is 0x%x \n",packet_type);
-    #endif
-       if(DSI_REG->DSI_RX_STA.LONG == 1)
-       {
-           recv_data_cnt = DSI_REG->DSI_RX_DATA.BYTE1 + DSI_REG->DSI_RX_DATA.BYTE2 * 16;
-           if(recv_data_cnt > 4)
-           {
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-              DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI read long packet data  exceeds 4 bytes \n");
-    #endif
-              recv_data_cnt = 4;
-           }
-           memcpy((void*)&recv_data, (void*)&DSI_REG->DSI_RX_DATA.BYTE4, recv_data_cnt);
-       }
-       else
-       {
-           memcpy((void*)&recv_data, (void*)&DSI_REG->DSI_RX_DATA.BYTE1, 2);
-       }
-    
-    #ifdef DSI_DRV_DEBUG_LOG_ENABLE
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI read 0x%x data is 0x%x \n",cmd,  recv_data);
-    #endif
-   }while(packet_type != 0x1C && packet_type != 0x21 && packet_type != 0x22);
-   /// here: we may receive a ACK packet which packet type is 0x02 (incdicates some error happened)
-   /// therefore we try re-read again until no ACK packet
-   /// But: if it is a good way to keep re-trying ???
-#endif
-   return recv_data;
-}
-
-/// return value: the data length we got
-UINT32 DSI_dcs_read_lcm_reg_v2(UINT8 cmd, UINT8 *buffer, UINT8 buffer_size)
-{
-    UINT32 max_try_count = 5;
-    UINT32 recv_data_cnt;
-    unsigned int read_timeout_ms;
-    unsigned char packet_type;
-	DSI_RX_DATA_REG read_data0;
-	DSI_RX_DATA_REG read_data1;
-	DSI_RX_DATA_REG read_data2;
-	DSI_RX_DATA_REG read_data3;
-#if 1
-    DSI_T0_INS t0;  
-
-#if ENABLE_DSI_INTERRUPT
-    static const long WAIT_TIMEOUT = 2 * HZ;    // 2 sec
-    long ret;
-#endif
-	if (DSI_REG->DSI_MODE_CTRL.MODE)
-		return 0;
-
-    if (buffer == NULL || buffer_size == 0)
+        printk("WARNING!! DISP_IsVideoMode is called before display driver inited!\n");
         return 0;
+    }
+}
 
-    do
+UINT32 DISP_GetScreenWidth(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+        return lcm_params->width;
+    else
     {
-       if(max_try_count == 0)
-	  return 0;
-       max_try_count--;
-       recv_data_cnt = 0;
-       read_timeout_ms = 20;
+        printk("WARNING!! get screen width before display driver inited!\n");
+        return 0;
+    }
+}
+EXPORT_SYMBOL(DISP_GetScreenWidth);
+
+UINT32 DISP_GetScreenHeight(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+        return lcm_params->height;
+    else
+    {
+        printk("WARNING!! get screen height before display driver inited!\n");
+        return 0;
+    }
+}
+
+UINT32 DISP_GetActiveHeight(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+    {
+        printk("[wwy]lcm_parms->height = %d\n", lcm_params->height);
+        return lcm_params->height;
+    }
+    else
+    {
+        printk("WARNING!! get active_height before display driver inited!\n");
+        return 0;
+    }
+}
+
+UINT32 DISP_GetActiveWidth(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+    {
+        printk("[wwy]lcm_parms->width = %d\n", lcm_params->width);
+        return lcm_params->width;
+    }
+    else
+    {
+        printk("WARNING!! get active_width before display driver inited!\n");
+        return 0;
+    }
+}
+
+UINT32 DISP_GetPhysicalHeight(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+    {
+        printk("[wwy]lcm_parms->physical_height = %d\n", lcm_params->physical_height);
+        return lcm_params->physical_height;
+    }
+    else
+    {
+        printk("WARNING!! get physical_height before display driver inited!\n");
+        return 0;
+    }
+}
+
+UINT32 DISP_GetPhysicalWidth(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+    {
+        printk("[wwy]lcm_parms->physical_width = %d\n", lcm_params->physical_width);
+        return lcm_params->physical_width;
+    }
+    else
+    {
+        printk("WARNING!! get physical_width before display driver inited!\n");
+        return 0;
+    }
+}
+
+DISP_STATUS DISP_SetScreenBpp(UINT32 bpp)
+{
+    ASSERT(bpp != 0);
+
+    if( bpp != 16   &&          \
+        bpp != 24   &&          \
+        bpp != 32   &&          \
+        1 )
+    {
+        DISP_LOG("DISP_SetScreenBpp error, not support %d bpp\n", bpp);
+        return DISP_STATUS_ERROR;
+    }
+
+    disp_fb_bpp = bpp;
+    DISP_LOG("DISP_SetScreenBpp %d bpp\n", bpp);
+
+    return DISP_STATUS_OK; 
+}
+
+UINT32 DISP_GetScreenBpp(void)
+{
+    return disp_fb_bpp; 
+}
+
+DISP_STATUS DISP_SetPages(UINT32 pages)
+{
+    ASSERT(pages != 0);
+
+    disp_fb_pages = pages;
+    DISP_LOG("DISP_SetPages %d pages\n", pages);
+
+    return DISP_STATUS_OK; 
+}
+
+UINT32 DISP_GetPages(void)
+{
+    return disp_fb_pages;   // Double Buffers
+}
+
+BOOL DISP_IsDirectLinkMode(void)
+{
+    return (-1 != direct_link_layer) ? TRUE : FALSE;
+}
+
+BOOL DISP_IsInOverlayMode(void)
+{
+    return is_overlaying;
+}
+
+UINT32 DISP_GetFBRamSize(void)
+{
+    return ALIGN_TO(DISP_GetScreenWidth(), 32) * 
+           ALIGN_TO(DISP_GetScreenHeight(), 32) * 
+           ((DISP_GetScreenBpp() + 7) >> 3) * 
+           DISP_GetPages();
+}
+
+UINT32 DISP_GetVRamSize(void)
+{
+    // Use a local static variable to cache the calculated vram size
+    //    
+    static UINT32 vramSize = 0;
+
+    if (0 == vramSize)
+    {
+        disp_drv_init_context();
+
+        ///get framebuffer size
+        vramSize = DISP_GetFBRamSize();
+
+        ///get DXI working buffer size
+        vramSize += disp_drv->get_working_buffer_size();
+
+        // get assertion layer buffer size
+        vramSize += DAL_GetLayerSize();
         
-       _WaitForEngineNotBusy();
+        // Align vramSize to 1MB
+        //
+        vramSize = ALIGN_TO_POW_OF_2(vramSize, 0x100000);
 
-       t0.CONFG = 0x04;        ///BTA
-       t0.Data0 = cmd;
-       if (buffer_size < 0x3)
-           t0.Data_ID = DSI_DCS_READ_PACKET_ID;
-       else
-           t0.Data_ID = DSI_GERNERIC_READ_LONG_PACKET_ID;
-       t0.Data1 = 0;
-
-       OUTREG32(&DSI_CMDQ_REG->data[0], AS_UINT32(&t0));
-       OUTREG32(&DSI_REG->DSI_CMDQ_SIZE, 1);
-
-       ///clear read ACK 
-       //DSI_REG->DSI_RACK.DSI_RACK = 1;
-       //DSI_REG->DSI_INTSTA.RD_RDY = 1;
-       //DSI_REG->DSI_INTSTA.CMD_DONE = 1;
-       //DSI_REG->DSI_INTEN.RD_RDY =  1;
-       //DSI_REG->DSI_INTEN.CMD_DONE=  1;
-       OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-       OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,RD_RDY,1);
-	   OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,CMD_DONE,1);
-	   OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,RD_RDY,1);
-	   OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,CMD_DONE,1);
-
-
-
-       OUTREG32(&DSI_REG->DSI_START, 0);
-       OUTREG32(&DSI_REG->DSI_START, 1);
-
-       /// the following code is to
-       /// 1: wait read ready
-       /// 2: ack read ready
-       /// 3: wait for CMDQ_DONE
-       /// 3: read data
-#if ENABLE_DSI_INTERRUPT
-       ret = wait_event_interruptible_timeout(_dsi_dcs_read_wait_queue, 
-                                                       !_IsEngineBusy(),
-                                                       WAIT_TIMEOUT);
-        if (0 == ret) {
-            xlog_printk(ANDROID_LOG_WARN, "DSI", " Wait for DSI engine read ready timeout!!!\n");
-
-				DSI_DumpRegisters();
-				
-				///do necessary reset here
-				//DSI_REG->DSI_RACK.DSI_RACK = 1;
-				OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-				DSI_Reset();
-
-                return 0;
-            }
-#else
-    #ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	if(dsi_log_on)
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Start polling DSI read ready!!!\n");
-    #endif
-        while(DSI_REG->DSI_INTSTA.RD_RDY == 0)  ///read clear
-        {
-            ///keep polling
-            msleep(1);
-            read_timeout_ms --;
-            
-            if(read_timeout_ms == 0)
-            {
-                DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " Polling DSI read ready timeout!!!\n");
-                DSI_DumpRegisters();
-
-                ///do necessary reset here
-                //DSI_REG->DSI_RACK.DSI_RACK = 1;
-                OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-                DSI_Reset();
-                return 0;
-            }
-        }
-    #ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	if(dsi_log_on)
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " End polling DSI read ready!!!\n");
-    #endif
-
-        //DSI_REG->DSI_RACK.DSI_RACK = 1;
-        OUTREGBIT(DSI_RACK_REG,DSI_REG->DSI_RACK,DSI_RACK,1);
-
-       ///clear interrupt status
-       //DSI_REG->DSI_INTSTA.RD_RDY = 1;
-       OUTREGBIT(DSI_INT_STATUS_REG,DSI_REG->DSI_INTSTA,RD_RDY,1);
-       ///STOP DSI
-       OUTREG32(&DSI_REG->DSI_START, 0);
-
-#endif
-
-       //DSI_REG->DSI_INTEN.RD_RDY =  0;
-       OUTREGBIT(DSI_INT_ENABLE_REG,DSI_REG->DSI_INTEN,RD_RDY,1);
-
-	   OUTREG32(&read_data0, AS_UINT32(&DSI_REG->DSI_RX_DATA0));
-	   OUTREG32(&read_data1, AS_UINT32(&DSI_REG->DSI_RX_DATA1));
-	   OUTREG32(&read_data2, AS_UINT32(&DSI_REG->DSI_RX_DATA2));
-	   OUTREG32(&read_data3, AS_UINT32(&DSI_REG->DSI_RX_DATA3));
-    #ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	if(dsi_log_on)
-    {
-       unsigned int i;
-//       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_STA : 0x%x \n", DSI_REG->DSI_RX_STA);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_SIZE : 0x%x \n", DSI_REG->DSI_CMDQ_SIZE.CMDQ_SIZE);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA0 : 0x%x \n", DSI_CMDQ_REG->data[0].byte0);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA1 : 0x%x \n", DSI_CMDQ_REG->data[0].byte1);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA2 : 0x%x \n", DSI_CMDQ_REG->data[0].byte2);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_CMDQ_DATA3 : 0x%x \n", DSI_CMDQ_REG->data[0].byte3);
-#if 1	
-	   DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA0 : 0x%x \n", DSI_REG->DSI_RX_DATA0);
-	   DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA1 : 0x%x \n", DSI_REG->DSI_RX_DATA1);
-	   DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA2 : 0x%x \n", DSI_REG->DSI_RX_DATA2);
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI_RX_DATA3 : 0x%x \n", DSI_REG->DSI_RX_DATA3);
-
-       printk("read_data0, %x,%x,%x,%x\n", read_data0.byte0, read_data0.byte1, read_data0.byte2, read_data0.byte3);
-	   printk("read_data1, %x,%x,%x,%x\n", read_data1.byte0, read_data1.byte1, read_data1.byte2, read_data1.byte3);
-	   printk("read_data2, %x,%x,%x,%x\n", read_data2.byte0, read_data2.byte1, read_data2.byte2, read_data2.byte3);
-	   printk("read_data3, %x,%x,%x,%x\n", read_data3.byte0, read_data3.byte1, read_data3.byte2, read_data3.byte3);
-#endif
+        DISP_LOG("DISP_GetVRamSize: %u bytes\n", vramSize);
     }
-    #endif
 
-#if 1
-	packet_type = read_data0.byte0;
-           
-    #ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	if(dsi_log_on)
-       DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", " DSI read packet_type is 0x%x \n",packet_type);
-    #endif
+    return vramSize;
+}
 
+UINT32 DISP_GetVRamSizeBoot(char *cmdline)
+{
+    static UINT32 vramSize = 0;
 
-
-	if(packet_type == 0x1A || packet_type == 0x1C)
+    if(vramSize)
     {
-    	recv_data_cnt = read_data0.byte1 + read_data0.byte2 * 16;
-		if(recv_data_cnt > 10)
-        {
-    #ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	if(dsi_log_on)
-              DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI read long packet data  exceeds 4 bytes \n");
-    #endif
-              recv_data_cnt = 10;
-           }
+        return vramSize;
+    }
 
-          if(recv_data_cnt > buffer_size)
-          {
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-			  if(dsi_log_on)
-              DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI read long packet data  exceeds buffer size: %d\n", buffer_size);
-#endif
-              recv_data_cnt = buffer_size;
-           }
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-		  if(dsi_log_on)
-          DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI read long packet size: %d\n", recv_data_cnt);
-#endif
-           memcpy((void*)buffer, (void*)&read_data1, recv_data_cnt);
-       }
-       else
-       {
-             if(recv_data_cnt > buffer_size)
-             {
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-				 if(dsi_log_on)
-                 DISP_LOG_PRINT(ANDROID_LOG_WARN, "DSI", " DSI read short packet data  exceeds buffer size: %d\n", buffer_size);
-#endif
-                 recv_data_cnt = buffer_size;
-             }
-           memcpy((void*)buffer,(void*)&read_data0.byte1, 2);
-       }
-#endif
-   }while(packet_type != 0x1C && packet_type != 0x21 && packet_type != 0x22 && packet_type != 0x1A);
-   /// here: we may receive a ACK packet which packet type is 0x02 (incdicates some error happened)
-   /// therefore we try re-read again until no ACK packet
-   /// But: if it is a good way to keep re-trying ???
-#endif
-   return recv_data_cnt;
-}
+    disp_get_lcm_name_boot(cmdline);
 
-UINT32 DSI_read_lcm_reg()
-{
-    return 0;
-}
-
-
-DSI_STATUS DSI_write_lcm_fb(unsigned int addr, bool long_length)
-{
-	DSI_T1_INS *t1_tmp=0;
-	DSI_CMDQ_CONFG CONFG_tmp;
-
-	CONFG_tmp.type=FB_WRITE;
-	CONFG_tmp.BTA=DISABLE_BTA;
-	CONFG_tmp.HS=HIGH_SPEED;
-
-	if(long_length)
-		CONFG_tmp.CL=CL_16BITS;
-	else
-		CONFG_tmp.CL=CL_8BITS;		
-
-	CONFG_tmp.TE=DISABLE_TE;
-	CONFG_tmp.RPT=DISABLE_RPT;
-
-
-	t1_tmp->CONFG = *((unsigned char *)(&CONFG_tmp));
-	t1_tmp->Data_ID= 0x39;
-	t1_tmp->mem_start0 = (addr&0xFF);	
-
-	if(long_length)
-		t1_tmp->mem_start1 = ((addr>>8)&0xFF);
-
-	return DSI_Write_T1_INS(t1_tmp);	
-
-	
-}
-
-
-DSI_STATUS DSI_read_lcm_fb(void)
-{
-	// TBD
-	return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_enable_MIPI_txio(bool en)
-{
-#if 0
-    if(en)
+    // if can't get the lcm type from uboot, we will return 0x800000 for a safe value
+    if(disp_drv)
+        vramSize = DISP_GetVRamSize();
+    else
     {
-        *(volatile unsigned int *) (INFRACFG_BASE+0x890) |= 0x00000100;    // enable MIPI TX IO    
+        printk("%s, can't get lcm type, reserved memory size will be set as 0x800000\n", __func__);
+        return 0xC00000;
+    }   
+    // Align vramSize to 1MB
+    //
+    vramSize = ALIGN_TO_POW_OF_2(vramSize, 0x100000);
+
+    printk("DISP_GetVRamSizeBoot: %u bytes[%dMB]\n", vramSize, (vramSize>>20));
+
+    return vramSize;
+}
+
+PANEL_COLOR_FORMAT DISP_GetPanelColorFormat(void)
+{
+    disp_drv_init_context();
+
+    return (disp_drv->get_panel_color_format) ?
+        (disp_drv->get_panel_color_format()) :
+        DISP_STATUS_NOT_IMPLEMENTED;
+}
+
+UINT32 DISP_GetPanelBPP(void)
+{
+    PANEL_COLOR_FORMAT fmt;
+    disp_drv_init_context();
+
+    if(disp_drv->get_panel_color_format == NULL) 
+    {
+        return DISP_STATUS_NOT_IMPLEMENTED;
+    }
+
+    fmt = disp_drv->get_panel_color_format();
+    switch(fmt)
+    {
+        case PANEL_COLOR_FORMAT_RGB332:
+            return 8;
+        case PANEL_COLOR_FORMAT_RGB444:
+            return 12;
+        case PANEL_COLOR_FORMAT_RGB565:
+            return 16;
+        case PANEL_COLOR_FORMAT_RGB666:
+            return 18;
+        case PANEL_COLOR_FORMAT_RGB888:
+            return 24;
+        default:
+            return 0;
+    }
+}
+
+UINT32 DISP_GetOutputBPPforDithering(void)
+{
+    disp_drv_init_context();
+
+    return (disp_drv->get_dithering_bpp) ?
+        (disp_drv->get_dithering_bpp()) :
+        DISP_STATUS_NOT_IMPLEMENTED;
+}
+
+DISP_STATUS DISP_Config_Overlay_to_Memory(unsigned int mva, int enable)
+{
+//  int ret = 0;
+
+//  struct disp_path_config_mem_out_struct mem_out = {0};
+
+    if(enable)
+    {
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_RGB888;
+
+        MemOutConfig.enable = 1;
+        MemOutConfig.dstAddr = mva;
+        MemOutConfig.srcROI.x = 0;
+        MemOutConfig.srcROI.y = 0;
+        MemOutConfig.srcROI.height= DISP_GetScreenHeight();
+        MemOutConfig.srcROI.width= DISP_GetScreenWidth();
+
+#if !defined(MTK_WFD_SUPPORT) && !defined(MTK_HDMI_SUPPORT)
+        mutex_lock(&MemOutSettingMutex);
+        MemOutConfig.dirty = 1;
+        mutex_unlock(&MemOutSettingMutex);
+#endif
     }
     else
     {
-        *(volatile unsigned int *) (INFRACFG_BASE+0x890) &= ~0x00000100;   // disable MIPI TX IO   
-    }
-#endif
-	return DSI_STATUS_OK;
-}
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_RGB888;
+        MemOutConfig.enable = 0;
+        MemOutConfig.dstAddr = mva;
+        MemOutConfig.srcROI.x = 0;
+        MemOutConfig.srcROI.y = 0;
+        MemOutConfig.srcROI.height= DISP_GetScreenHeight();
+        MemOutConfig.srcROI.width= DISP_GetScreenWidth();
 
+//#if !defined(MTK_WFD_SUPPORT) && !defined(MTK_HDMI_SUPPORT)
+        mutex_lock(&MemOutSettingMutex);
+        MemOutConfig.dirty = 1;     
+        mutex_unlock(&MemOutSettingMutex);
+//#endif
 
-bool Need_Wait_ULPS(void)
-{
-#ifndef MT65XX_NEW_DISP
-	if(((INREG32(DSI_BASE + 0x14C)>> 24) & 0xFF) != 0x04) {
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:true \n", __func__);
-#endif
-		return TRUE;
-
-	} else {
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:false \n", __func__);
-#endif
-		return FALSE;
-
-	}
-#endif
-}
-
-
-DSI_STATUS Wait_ULPS_Mode(void)
-{
-#ifndef MT65XX_NEW_DISP
-	DSI_PHY_LCCON_REG lccon_reg=DSI_REG->DSI_PHY_LCCON;
-	DSI_PHY_LD0CON_REG ld0con=DSI_REG->DSI_PHY_LD0CON;
-
-	lccon_reg.LC_ULPM_EN =1;
-	ld0con.L0_ULPM_EN=1;
-	OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&lccon_reg));
-	OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&ld0con));
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:enter \n", __func__);
-#endif
-
-	while(((INREG32(DSI_BASE + 0x14C)>> 24) & 0xFF) != 0x04)
-	{
-		lcm_mdelay(5);
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI+%04x : 0x%08x \n", DSI_BASE, INREG32(DSI_BASE + 0x14C));
-#endif
-	}
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:exit \n", __func__);
-#endif
-#endif
-	return DSI_STATUS_OK;
-
-}
-
-
-DSI_STATUS Wait_WakeUp(void)
-{
-#ifndef MT65XX_NEW_DISP
-	DSI_PHY_LCCON_REG lccon_reg=DSI_REG->DSI_PHY_LCCON;
-	DSI_PHY_LD0CON_REG ld0con=DSI_REG->DSI_PHY_LD0CON;
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:enter \n", __func__);
-#endif
-
-	lccon_reg.LC_ULPM_EN =0;
-	ld0con.L0_ULPM_EN=0;
-	OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&lccon_reg));
-	OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&ld0con));
-
-	lcm_mdelay(1);//Wait 1ms for LCM Spec
-
-	lccon_reg.LC_WAKEUP_EN =1;
-	ld0con.L0_WAKEUP_EN=1;
-	OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&lccon_reg));
-	OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&ld0con));
-
-	while(((INREG32(DSI_BASE + 0x148)>> 8) & 0xFF) != 0x01)
-	{
-		lcm_mdelay(5);
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-		DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[soso]DSI+%04x : 0x%08x \n", DSI_BASE, INREG32(DSI_BASE + 0x148));
-#endif
-	}
-
-#ifdef DDI_DRV_DEBUG_LOG_ENABLE
-	DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "[%s]:exit \n", __func__);
-#endif
-
-	lccon_reg.LC_WAKEUP_EN =0;
-	ld0con.L0_WAKEUP_EN=0;
-	OUTREG32(&DSI_REG->DSI_PHY_LCCON, AS_UINT32(&lccon_reg));
-	OUTREG32(&DSI_REG->DSI_PHY_LD0CON, AS_UINT32(&ld0con));
-#endif
-	return DSI_STATUS_OK;
-
-}
-
-// -------------------- Retrieve Information --------------------
-
-DSI_STATUS DSI_DumpRegisters(void)
-{
-    UINT32 i;
-
-    DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "---------- Start dump DSI registers ----------\n");
-    
-    for (i = 0; i < sizeof(DSI_REGS); i += 4)
-    {
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI+%04x : 0x%08x\n", i, INREG32(DSI_BASE + i));
-    }
-
-    for (i = 0; i < sizeof(DSI_CMDQ_REGS); i += 4)
-    {
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI_CMD+%04x(%p) : 0x%08x\n", i, (UINT32*)(DSI_BASE+0x180+i), INREG32((DSI_BASE+0x180+i)));
-    }
-
-    for (i = 0; i < sizeof(DSI_PHY_REGS); i += 4)
-    {
-        DISP_LOG_PRINT(ANDROID_LOG_INFO, "DSI", "DSI_PHY+%04x(%p) : 0x%08x\n", i, (UINT32*)(MIPI_CONFIG_BASE+0x800+i), INREG32((MIPI_CONFIG_BASE+0x800+i)));
+        // Wait for reg update.
+        wait_event_interruptible(reg_update_wq, !MemOutConfig.dirty);
     }
 
     return DSI_STATUS_OK;
 }
 
 
-static LCM_PARAMS lcm_params_for_clk_setting;
-
-
-DSI_STATUS DSI_FMDesense_Query(void)
+DISP_STATUS DISP_Capture_Framebuffer( unsigned int pvbuf, unsigned int bpp, unsigned int is_early_suspended )
 {
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_FM_Desense(unsigned long freq)
-{
-    ///need check
-    DSI_Change_CLK(freq);
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_Reset_CLK(void)
-{
-    extern LCM_PARAMS *lcm_params;
-
-    _WaitForEngineNotBusy();
-	DSI_PHY_TIMCONFIG(lcm_params);
-	DSI_PHY_clk_setting(lcm_params);
-	return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_Get_Default_CLK(unsigned int *clk)
-{
-    extern LCM_PARAMS *lcm_params;
-	unsigned int div2_real = lcm_params->dsi.pll_div2 ? lcm_params->dsi.pll_div2 : 0x1;
-
-    *clk = 13 * (lcm_params->dsi.pll_div1 + 1) / div2_real;
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_Get_Current_CLK(unsigned int *clk)
-{
-    if(mipitx_con1.RG_PLL_DIV2 == 0)
-        *clk = 26 * (mipitx_con1.RG_PLL_DIV1 + 1);
-    else
-        *clk = 13 * (mipitx_con1.RG_PLL_DIV1 + 1) / mipitx_con1.RG_PLL_DIV2;
-
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_Change_CLK(unsigned int clk)
-{
-    extern LCM_PARAMS *lcm_params;
-
-    if(clk > 1000)
-        return DSI_STATUS_ERROR;
-    memcpy((void *)&lcm_params_for_clk_setting, (void *)lcm_params, sizeof(LCM_PARAMS));
-
-    for(lcm_params_for_clk_setting.dsi.pll_div2 = 15; lcm_params_for_clk_setting.dsi.pll_div2 > 0; lcm_params_for_clk_setting.dsi.pll_div2--)
-    {
-        for(lcm_params_for_clk_setting.dsi.pll_div1 = 0; lcm_params_for_clk_setting.dsi.pll_div1 < 39; lcm_params_for_clk_setting.dsi.pll_div1++)
-        {
-            if((13 * (lcm_params_for_clk_setting.dsi.pll_div1 + 1) / lcm_params_for_clk_setting.dsi.pll_div2) >= clk)
-                goto end;
-        }
-    }
-
-    if(lcm_params_for_clk_setting.dsi.pll_div2 == 0)
-    {
-        for(lcm_params_for_clk_setting.dsi.pll_div1 = 0; lcm_params_for_clk_setting.dsi.pll_div1 < 39; lcm_params_for_clk_setting.dsi.pll_div1++)
-        {
-            if((26 * (lcm_params_for_clk_setting.dsi.pll_div1 + 1)) >= clk)
-                goto end;
-        }
-    }
-
-end:
-    _WaitForEngineNotBusy();
-	DSI_PHY_TIMCONFIG(&lcm_params_for_clk_setting);
-	DSI_PHY_clk_setting(&lcm_params_for_clk_setting);
-
-    return DSI_STATUS_OK;
-}
-
-DSI_STATUS DSI_Capture_Framebuffer(unsigned int pvbuf, unsigned int bpp, bool cmd_mode)
-{
-	unsigned int mva;
+    unsigned int mva;
     unsigned int ret = 0;
-	M4U_PORT_STRUCT portStruct;
-	
-	struct disp_path_config_mem_out_struct mem_out = {0};
-	printk("enter DSI_Capture_FB!\n");
-	
-	if(bpp == 32)
-		mem_out.outFormat = WDMA_OUTPUT_FORMAT_ARGB;
-	else if(bpp == 16)
-		mem_out.outFormat = WDMA_OUTPUT_FORMAT_RGB565;
-	else if(bpp == 24)
-		mem_out.outFormat = WDMA_OUTPUT_FORMAT_RGB888;
-	else
-		printk("DSI_Capture_FB, fb color format not support\n");
-	
-	printk("before alloc MVA: va = 0x%x, size = %d\n", pvbuf, DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8);
-   	ret = m4u_alloc_mva(M4U_CLNTMOD_WDMA, 
-		                pvbuf, 
-		                DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8, 
-		                0,
-		                0,
-		                &mva);
-	if(ret!=0)
-	{
+    M4U_PORT_STRUCT portStruct;
+    DISP_FUNC();
+    disp_drv_init_context();
+    disp_module_clock_on(DISP_MODULE_WDMA1, "Screen Capture");
+
+    if (is_early_suspended)
+    {
+        if(lcm_params->type==LCM_TYPE_DSI)
+        {
+            DSI_SetMode(lcm_params->dsi.mode);
+        }
+    }
+
+    MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 0, pvbuf);
+    MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 1, bpp);
+    ret = m4u_alloc_mva(M4U_CLNTMOD_WDMA, 
+        pvbuf, 
+        DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8, 
+        0,
+        0,
+        &mva);
+    if(ret!=0)
+    {
+        disp_module_clock_off(DISP_MODULE_WDMA1, "Screen Capture");    
         printk("m4u_alloc_mva() fail! \n");
-		return DSI_STATUS_OK;  
-	}
-	printk("addr=0x%x, format=d \n", mva, mem_out.outFormat);
+        return DSI_STATUS_OK;  
+    }
 
-	m4u_dma_cache_maint(M4U_CLNTMOD_WDMA, 
-		                pvbuf, 
-		                DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8,
-		                DMA_BIDIRECTIONAL);
-	
-	portStruct.ePortID = M4U_PORT_WDMA1;		   //hardware port ID, defined in M4U_PORT_ID_ENUM
-	portStruct.Virtuality = 1;						   
-	portStruct.Security = 0;
+    m4u_dma_cache_maint(M4U_CLNTMOD_WDMA, 
+        (const void *)pvbuf, 
+        DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8,
+        DMA_BIDIRECTIONAL);
+
+    portStruct.ePortID = M4U_PORT_WDMA1;         //hardware port ID, defined in M4U_PORT_ID_ENUM
+    portStruct.Virtuality = 1;                           
+    portStruct.Security = 0;
     portStruct.domain = 0;            //domain : 0 1 2 3
-	portStruct.Distance = 1;
-	portStruct.Direction = 0; 	
-	m4u_config_port(&portStruct);
-	
-	mem_out.enable = 1;
-	mem_out.dstAddr = mva;
-	mem_out.srcROI.x = 0;
-	mem_out.srcROI.y = 0;
-	mem_out.srcROI.height= DISP_GetScreenHeight();
-	mem_out.srcROI.width= DISP_GetScreenWidth();
+    portStruct.Distance = 1;
+    portStruct.Direction = 0;   
+    m4u_config_port(&portStruct);
 
-	_WaitForEngineNotBusy();
-    disp_path_get_mutex();
-	disp_path_config_mem_out(&mem_out);
-	printk("Wait DSI idle \n");
+    mutex_lock(&MemOutSettingMutex);
+    if(bpp == 32)
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_ARGB;
+    else if(bpp == 16)
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_RGB565;
+    else if(bpp == 24)
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_RGB888;
+    else
+    {
+        printk("DSI_Capture_FB, fb color format not support\n");
+        MemOutConfig.outFormat = WDMA_OUTPUT_FORMAT_RGB888;
+    }
 
-	if(cmd_mode)
-		DSI_EnableClk();
+    MemOutConfig.enable = 1;
+    MemOutConfig.dstAddr = mva;
+    MemOutConfig.srcROI.x = 0;
+    MemOutConfig.srcROI.y = 0;
+    MemOutConfig.srcROI.height= DISP_GetScreenHeight();
+    MemOutConfig.srcROI.width= DISP_GetScreenWidth();
+    if (is_early_suspended == 0)
+        MemOutConfig.dirty = 1;
+    mutex_unlock(&MemOutSettingMutex);
+    MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 2, mva);
+    if (is_early_suspended)
+    {
+        disp_path_get_mutex();
+        disp_path_config_mem_out_without_lcd(&MemOutConfig);
+        disp_path_release_mutex();
+        // Wait for mem out done.
+        disp_path_wait_mem_out_done();
+        MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 3, 0);
+        MemOutConfig.enable = 0;
+        if (lcm_params->type == LCM_TYPE_DPI)
+            disp_path_get_mutex();
+        disp_path_config_mem_out_without_lcd(&MemOutConfig);
+        if (lcm_params->type == LCM_TYPE_DPI)
+            disp_path_release_mutex();
+    }
+    else
+    {
+        // Wait for mem out done.
+        disp_path_wait_mem_out_done();
+        MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 3, 0);
 
-	disp_path_release_mutex();
+        mutex_lock(&MemOutSettingMutex);
+        MemOutConfig.enable = 0;
+        MemOutConfig.dirty = 1;
+        mutex_unlock(&MemOutSettingMutex);
+        // Wait for reg update.
+        wait_event_interruptible(reg_update_wq, !MemOutConfig.dirty);
+        MMProfileLogEx(MTKFB_MMP_Events.CaptureFramebuffer, MMProfileFlagPulse, 4, 0);
+    }
 
-	_WaitForEngineNotBusy();
-//	msleep(20);
-	disp_path_get_mutex();
-	mem_out.enable = 0;
-	disp_path_config_mem_out(&mem_out);
-	
-	if(cmd_mode)
-		DSI_EnableClk();
+    BOOL deconfigWdma = TRUE;
 
-	disp_path_release_mutex();
+#if defined(MTK_HDMI_SUPPORT)
+    deconfigWdma &= !is_hdmi_active();
+#endif
 
-	portStruct.ePortID = M4U_PORT_WDMA1;		   //hardware port ID, defined in M4U_PORT_ID_ENUM
-	portStruct.Virtuality = 0;						   
-	portStruct.Security = 0;
-	portStruct.domain = 0;			  //domain : 0 1 2 3
-	portStruct.Distance = 1;
-	portStruct.Direction = 0;	
-	m4u_config_port(&portStruct);
+#if defined(MTK_WFD_SUPPORT)
+    deconfigWdma &= !is_wfd_active();
+#endif
+
+    if(deconfigWdma)
+    {
+        portStruct.ePortID = M4U_PORT_WDMA1;         //hardware port ID, defined in M4U_PORT_ID_ENUM
+        portStruct.Virtuality = 0;
+        portStruct.Security = 0;
+        portStruct.domain = 0;            //domain : 0 1 2 3
+        portStruct.Distance = 1;
+        portStruct.Direction = 0;
+        m4u_config_port(&portStruct);
+    }
 
     m4u_dealloc_mva(M4U_CLNTMOD_WDMA, 
-                    pvbuf, 
-		                DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8, 
-		                mva);
+        pvbuf, 
+        DISP_GetScreenHeight()*DISP_GetScreenWidth()*bpp/8, 
+        mva);
 
-	return DSI_STATUS_OK;
+    disp_module_clock_off(DISP_MODULE_WDMA1, "Screen Capture");    
+
+    return DISP_STATUS_OK;
 }
 
-
-DSI_STATUS DSI_TE_Enable(BOOL enable)
+DISP_STATUS DISP_Capture_Videobuffer(unsigned int pvbuf, unsigned int bpp, unsigned int video_rotation)
 {
-	dsiTeEnable = enable;
+    DISP_FUNC();
+    if (down_interruptible(&sem_update_screen)) {
+        printk("ERROR: Can't get sem_update_screen in DISP_Capture_Videobuffer()\n");
+        return DISP_STATUS_ERROR;
+    }
+    disp_drv_init_context();
+    LCD_Capture_Videobuffer(pvbuf, bpp, video_rotation);
+    up(&sem_update_screen);
+    return DISP_STATUS_OK;
+}
+// xuecheng, 2010-09-19
+// this api is for mATV signal interfere workaround.
+// immediate update == (TE disabled + delay update in overlay mode disabled)
+static BOOL is_immediateupdate = false;
+DISP_STATUS DISP_ConfigImmediateUpdate(BOOL enable)
+{
+    disp_drv_init_context();
 
-	return DSI_STATUS_OK;
+    if(enable == TRUE)
+    {
+        LCD_TE_Enable(FALSE);
+    }
+    else
+    {
+        if(disp_drv->init_te_control)
+            disp_drv->init_te_control();
+        else
+            return DISP_STATUS_NOT_IMPLEMENTED;
+    }
+
+    is_immediateupdate = enable;
+
+    return DISP_STATUS_OK;
 }
 
+BOOL DISP_IsImmediateUpdate(void)
+{
+    return is_immediateupdate;
+}
 
+DISP_STATUS DISP_FMDesense_Query()
+{
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        return (DISP_STATUS)LCD_FMDesense_Query();
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        return (DISP_STATUS)DPI_FMDesense_Query();
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        return (DISP_STATUS)DSI_FMDesense_Query();
+    }
+    else
+    {
+        DISP_LOG("DISP_FMDesense_Query():unknown interface\n");
+    }
+    
+    return DISP_STATUS_ERROR;
+}
+
+DISP_STATUS DISP_FM_Desense(unsigned long freq)
+{
+    DISP_STATUS ret = DISP_STATUS_OK;
+    
+    if (down_interruptible(&sem_update_screen)) {
+        DISP_LOG("ERROR: Can't get sem_update_screen in DISP_FM_Desense()\n");
+        return DISP_STATUS_ERROR;
+    }
+    
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_FM_Desense():DBI interface\n");        
+        LCD_CHECK_RET(LCD_FM_Desense(ctrl_if, freq));
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        DISP_LOG("DISP_FM_Desense():DPI interface\n");
+        DPI_CHECK_RET(DPI_FM_Desense(freq));
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        DISP_LOG("DISP_FM_Desense():DSI interface\n");
+        DSI_CHECK_RET(DSI_FM_Desense(freq));
+    }
+    else
+    {
+        DISP_LOG("DISP_FM_Desense():unknown interface\n");
+        ret = DISP_STATUS_ERROR;
+    }
+
+    up(&sem_update_screen);
+    return ret;
+}
+
+DISP_STATUS DISP_Reset_Update()
+{
+    DISP_STATUS ret = DISP_STATUS_OK;
+
+    if (down_interruptible(&sem_update_screen)) {
+        DISP_LOG("ERROR: Can't get sem_update_screen in DISP_Reset_Update()\n");
+        return DISP_STATUS_ERROR;
+    }
+    
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_Reset_Update():DBI interface\n");        
+        LCD_CHECK_RET(LCD_Reset_WriteCycle(ctrl_if));
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        DISP_LOG("DISP_Reset_Update():DPI interface\n");
+        DPI_CHECK_RET(DPI_Reset_CLK());
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        DISP_LOG("DISP_Reset_Update():DSI interface\n");
+        DSI_CHECK_RET(DSI_Reset_CLK());
+    }
+    else
+    {
+        DISP_LOG("DISP_Reset_Update():unknown interface\n");
+        ret = DISP_STATUS_ERROR;
+    }
+
+    up(&sem_update_screen);
+    
+    return ret;
+}
+
+DISP_STATUS DISP_Get_Default_UpdateSpeed(unsigned int *speed)
+{
+    DISP_STATUS ret = DISP_STATUS_OK;
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_Get_Default_UpdateSpeed():DBI interface\n");        
+        LCD_CHECK_RET(LCD_Get_Default_WriteCycle(ctrl_if, speed));
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        DISP_LOG("DISP_Get_Default_UpdateSpeed():DPI interface\n");
+        DPI_CHECK_RET(DPI_Get_Default_CLK(speed));
+    }
+    else  if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        DISP_LOG("DISP_Get_Default_UpdateSpeed():DSI interface\n");
+        DSI_CHECK_RET(DSI_Get_Default_CLK(speed));
+    }
+    else
+    {
+        DISP_LOG("DISP_Reset_Update():unknown interface\n");
+        ret = DISP_STATUS_ERROR;
+    }
+
+    return ret;
+}
+
+DISP_STATUS DISP_Get_Current_UpdateSpeed(unsigned int *speed)
+{
+    DISP_STATUS ret = DISP_STATUS_OK;
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_Get_Current_UpdateSpeed():DBI interface\n");        
+        LCD_CHECK_RET(LCD_Get_Current_WriteCycle(ctrl_if, speed));
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        DISP_LOG("DISP_Get_Current_UpdateSpeed():DPI interface\n");
+        DPI_CHECK_RET(DPI_Get_Current_CLK(speed));
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        DISP_LOG("DISP_Get_Current_UpdateSpeed():DSI interface\n");
+        DSI_CHECK_RET(DSI_Get_Current_CLK(speed));
+    }
+    else
+    {
+        DISP_LOG("DISP_Reset_Update():unknown interface\n");
+        ret = DISP_STATUS_ERROR;
+    }
+
+    return ret;
+}
+
+DISP_STATUS DISP_Change_Update(unsigned int speed)
+{
+    DISP_STATUS ret = DISP_STATUS_OK;
+
+    if (down_interruptible(&sem_update_screen)) {
+        DISP_LOG("ERROR: Can't get sem_update_screen in DISP_Change_Update()\n");
+        return DISP_STATUS_ERROR;
+    }
+    
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_Change_Update():DBI interface\n");        
+        LCD_CHECK_RET(LCD_Change_WriteCycle(ctrl_if, speed));
+    }
+    else if(LCM_TYPE_DPI == lcm_params->type){//DPI
+        DISP_LOG("DISP_Change_Update():DPI interface\n");
+        DPI_CHECK_RET(DPI_Change_CLK(speed));
+    }
+    else if(LCM_TYPE_DSI == lcm_params->type){// DSI
+        DISP_LOG("DISP_Change_Update():DSI interface\n");
+        DSI_CHECK_RET(DSI_Change_CLK(speed));
+    }
+    else
+    {
+        DISP_LOG("DISP_Reset_Update():unknown interface\n");
+        ret = DISP_STATUS_ERROR;
+    }
+
+    up(&sem_update_screen);
+
+    return ret;
+}
+
+#if defined(MTK_M4U_SUPPORT)
+DISP_STATUS DISP_InitM4U()
+{
+    LCD_InitM4U();
+    if(LCM_TYPE_DPI == lcm_params->type){
+//      DPI_InitM4U();     //DPI not use m4u currently
+    }
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_ConfigAssertLayerMva()
+{
+    unsigned int mva;
+    ASSERT(dal_layerPA);
+    LCD_CHECK_RET(LCD_AllocUIMva(dal_layerPA, &mva, DAL_GetLayerSize())); 
+    DISP_LOG("DAL Layer PA = DAL_layerPA = 0x%x, MVA = 0x%x\n", dal_layerPA, mva);
+    LCD_CHECK_RET(LCD_LayerSetAddress(ASSERT_LAYER, mva));
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_AllocUILayerMva(unsigned int pa, unsigned int *mva, unsigned int size)
+{
+    LCD_CHECK_RET(LCD_AllocUIMva(pa, mva, size)); 
+    DISP_LOG("UI Layer PA = 0x%x, MVA = 0x%x\n", pa, *mva);
+    if(LCM_TYPE_DPI == lcm_params->type){ //dpi buffer
+        unsigned int i,dpi_mva;
+        UINT32 dpi_size = DISP_GetScreenWidth()*DISP_GetScreenHeight()*disp_drv->get_working_buffer_bpp();
+        for(i=0;i<lcm_params->dpi.intermediat_buffer_num;i++){
+            LCD_AllocUIMva(pa + size + i * dpi_size, &dpi_mva, dpi_size);
+            DISP_LOG("dpi pa = 0x%x,size = %d, mva = 0x%x\n", pa + size + i * dpi_size, dpi_size, dpi_mva);
+            LCD_CHECK_RET(LCD_FBSetAddress(LCD_FB_0 + i, dpi_mva));
+        }
+    }
+
+    if((LCM_TYPE_DSI == lcm_params->type) && (lcm_params->dsi.mode != CMD_MODE)){ //dsi buffer
+        unsigned int i,dsi_mva;
+        UINT32 dsi_size = DISP_GetScreenWidth()*DISP_GetScreenHeight()*disp_drv->get_working_buffer_bpp();
+        for(i=0;i<lcm_params->dsi.intermediat_buffer_num;i++){
+            LCD_AllocUIMva(pa + size + i * dsi_size, &dsi_mva, dsi_size);
+            DISP_LOG("dsi pa = 0x%x,size = %d, mva = 0x%x\n", pa + size + i * dsi_size, dsi_size, dsi_mva);
+            LCD_CHECK_RET(LCD_FBSetAddress(LCD_FB_0 + i, dsi_mva));
+        }
+    }
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_AllocOverlayMva(unsigned int va, unsigned int *mva, unsigned int size)
+{
+    LCD_CHECK_RET(LCD_AllocOverlayMva(va, mva, size));
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_DeallocMva(unsigned int va, unsigned int mva, unsigned int size)
+{
+    LCD_DeallocMva(va, mva, size);
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_M4U_On(BOOL enable)
+{
+    LCD_M4U_On(enable);
+
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_DumpM4U(void)
+{
+    LCD_DumpM4U();
+    return DISP_STATUS_OK;
+}
+
+#endif
+
+DISP_STATUS DISP_ChangeLCDWriteCycle()// this function is called when bootanimation start and stop in Surfaceflinger on 6573, because 6573 LCDC DBI write speed not stable when bootup
+{
+#if 0 //defined(only for MT6573)
+    if(LCM_TYPE_DBI == lcm_params->type){//DBI
+        DISP_LOG("DISP_ChangeLCDWriteCycle():DBI interface\n");        
+        LCD_CHECK_RET(LCD_Change_WriteCycle_ex(ctrl_if));
+    }
+    else{//DPI and DSI has not this issue, so not need change
+        DISP_LOG("DPI or DSI interface not need change write cycles\n");
+    }
+#endif
+    return DISP_STATUS_OK;
+}
+
+const char* DISP_GetLCMId(void)
+{
+    if(lcm_drv)
+        return lcm_drv->name;
+    else
+        return NULL;
+}
+
+BOOL DISP_EsdCheck(void)
+{
+    BOOL result = FALSE;
+
+    disp_drv_init_context();
+    MMProfileLogEx(MTKFB_MMP_Events.EsdCheck, MMProfileFlagPulse, 0x10, 0);
+
+    if(lcm_drv->esd_check == NULL && disp_drv->esd_check == NULL)
+    {
+        return FALSE;
+    }
+
+    if (down_interruptible(&sem_update_screen)) {
+        printk("ERROR: Can't get sem_update_screen in DISP_EsdCheck()\n");
+        return FALSE;
+    }
+    MMProfileLogEx(MTKFB_MMP_Events.EsdCheck, MMProfileFlagPulse, 0x11, 0);
+
+    if(is_lcm_in_suspend_mode)
+    {
+        up(&sem_update_screen);
+        return FALSE;
+    }
+
+    if(disp_drv->esd_check)
+        result |= disp_drv->esd_check();
+    MMProfileLogEx(MTKFB_MMP_Events.EsdCheck, MMProfileFlagPulse, 0x12, 0);
+
+#ifndef MT65XX_NEW_DISP
+    LCD_CHECK_RET(LCD_WaitForNotBusy());
+    if(lcm_params->type==LCM_TYPE_DSI)
+        DSI_CHECK_RET(DSI_WaitForNotBusy());
+
+    if(lcm_drv->esd_check)
+    {
+        mutex_lock(&LcmCmdMutex);
+        result |= lcm_drv->esd_check();
+        mutex_unlock(&LcmCmdMutex);
+    }
+#endif
+
+    up(&sem_update_screen);
+
+    return result;
+}
+
+BOOL DISP_EsdRecoverCapbility(void)
+{
+    if(!disp_drv_init_context())
+        return FALSE;
+
+    if((lcm_drv->esd_check && lcm_drv->esd_recover) || (lcm_params->dsi.lcm_ext_te_monitor) || (lcm_params->dsi.lcm_int_te_monitor))
+    {
+        return TRUE;
+    }
+    else
+    {
+        return FALSE;
+    }
+}
+
+BOOL DISP_EsdRecover(void)
+{
+    BOOL result = FALSE;
+    DISP_LOG("DISP_EsdRecover enter");
+
+    if(lcm_drv->esd_recover == NULL)
+    {
+        return FALSE;
+    }
+
+    if (down_interruptible(&sem_update_screen)) {
+        printk("ERROR: Can't get sem_update_screen in DISP_EsdRecover()\n");
+        return FALSE;
+    }
+
+    if(is_lcm_in_suspend_mode)
+    {
+        up(&sem_update_screen);
+        return FALSE;
+    }
+
+    LCD_CHECK_RET(LCD_WaitForNotBusy());
+    if(lcm_params->type==LCM_TYPE_DSI)
+    {
+        DSI_CHECK_RET(DSI_WaitForNotBusy());        
+    }
+
+     DISP_LOG("DISP_EsdRecover do LCM recover");
+
+    // do necessary configuration reset for LCM re-init
+    if(disp_drv->esd_reset)
+        disp_drv->esd_reset();
+
+    /// LCM recover
+    mutex_lock(&LcmCmdMutex);
+    result = lcm_drv->esd_recover();
+    mutex_unlock(&LcmCmdMutex);
+
+    up(&sem_update_screen);
+
+    return result;
+}
+
+unsigned long DISP_GetLCMIndex(void)
+{
+    return u4IndexOfLCMList;
+}
+
+DISP_STATUS DISP_PrepareSuspend(void)
+{
+    if(lcm_params->type==LCM_TYPE_DSI && lcm_params->dsi.mode != CMD_MODE)
+    {       
+        DSI_SetMode(CMD_MODE);
+    }
+    return DISP_STATUS_OK;
+}
+
+DISP_STATUS DISP_GetLayerInfo(DISP_LAYER_INFO *pLayer)
+{
+    int id = pLayer->id;
+    mutex_lock(&OverlaySettingMutex);
+    pLayer->curr_en = captured_layer_config[id].layer_en;
+    pLayer->next_en = cached_layer_config[id].layer_en;
+    pLayer->hw_en = realtime_layer_config[id].layer_en;
+    pLayer->curr_idx = captured_layer_config[id].buff_idx;
+    pLayer->next_idx = cached_layer_config[id].buff_idx;
+    pLayer->hw_idx = realtime_layer_config[id].buff_idx;
+    pLayer->curr_identity = captured_layer_config[id].identity;
+    pLayer->next_identity = cached_layer_config[id].identity;
+    pLayer->hw_identity = realtime_layer_config[id].identity;
+    pLayer->curr_conn_type = captured_layer_config[id].connected_type;
+    pLayer->next_conn_type = cached_layer_config[id].connected_type;
+    pLayer->hw_conn_type = realtime_layer_config[id].connected_type;
+    mutex_unlock(&OverlaySettingMutex);
+    return DISP_STATUS_OK;
+}
