@@ -2233,6 +2233,20 @@ UINT32 DISP_GetScreenHeight(void)
     }
 }
 
+UINT32 DISP_GetActiveHeight(void)
+{
+    disp_drv_init_context();
+    if(lcm_params)
+    {
+        printk("[wwy]lcm_parms->height = %d\n", lcm_params->height);
+        return lcm_params->height;
+    }
+    else
+    {
+        printk("WARNING!! get active_height before display driver inited!\n");
+        return 0;
+    }
+}
 UINT32 DISP_GetActiveWidth(void)
 {
     disp_drv_init_context();
@@ -2240,21 +2254,6 @@ UINT32 DISP_GetActiveWidth(void)
     {
         printk("[wwy]lcm_parms->width = %d\n", lcm_params->width);
         return lcm_params->width;
-    }
-    else
-    {
-        printk("WARNING!! get active_width before display driver inited!\n");
-        return 0;
-    }
-}
-
-UINT32 DISP_GetActiveWidth(void)
-{
-    disp_drv_init_context();
-    if(lcm_params)
-    {
-        printk("[wwy]lcm_parms->width = %d\n", lcm_params->width);  // changed
-        return lcm_params->width;  // changed
     }
     else
     {
