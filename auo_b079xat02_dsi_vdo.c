@@ -1,5 +1,7 @@
 #ifndef BUILD_LK
 #include <linux/string.h>
+#else
+#include <string.h>   //for fixed warning issue
 #endif
 
 #ifdef BUILD_LK
@@ -17,9 +19,9 @@
 #define FRAME_WIDTH  (768)
 #define FRAME_HEIGHT (1024)
 
-#define GPIO_LCD_PWR_EN      GPIO142
-#define GPIO_LCD_RST_EN      GPIO178
-#define GPIO_LCD_BL_EN       GPIO179
+#define GPIO_LCD_PWR_EN      GPIO115 //GPIO142
+#define GPIO_LCD_RST_EN      GPIO65  //GPIO178
+#define GPIO_LCD_BL_EN       GPIO75 //GPIO179
 
 #define LCM_DSI_CMD_MODE									0
 
@@ -27,7 +29,14 @@
 //  Local Variables
 // ---------------------------------------------------------------------------
 
-static LCM_UTIL_FUNCS lcm_util = {0};
+//static LCM_UTIL_FUNCS lcm_util = {0}; //for fixed warning issue
+static LCM_UTIL_FUNCS lcm_util = 
+{
+	.set_reset_pin = NULL,
+	.udelay = NULL,
+	.mdelay = NULL,
+};
+
 
 #define SET_RESET_PIN(v)    								(lcm_util.set_reset_pin((v)))
 
@@ -56,8 +65,11 @@ static void lcd_power_en(unsigned char enabled)
         
       #ifdef BUILD_LK
         //VGP6 3.3V
-        pmic_config_interface(DIGLDO_CON33, 0x07, PMIC_RG_VGP6_VOSEL_MASK, PMIC_RG_VGP6_VOSEL_SHIFT);  
-        pmic_config_interface(DIGLDO_CON12, 0x1, PMIC_RG_VGP6_EN_MASK, PMIC_RG_VGP6_EN_SHIFT); 
+        //pmic_config_interface(DIGLDO_CON33, 0x07, PMIC_RG_VGP6_VOSEL_MASK, PMIC_RG_VGP6_VOSEL_SHIFT);  
+        //pmic_config_interface(DIGLDO_CON12, 0x1, PMIC_RG_VGP6_EN_MASK, PMIC_RG_VGP6_EN_SHIFT); 
+		//VGP6 3.3V
+	pmic_config_interface(0x424, 0x1, 0x1, 15); 
+	pmic_config_interface(0x45a, 0x07, 0x07, 5);
       #else
         hwPowerOn(MT65XX_POWER_LDO_VGP6, VOL_3300, "LCM");
       #endif   
@@ -72,8 +84,11 @@ static void lcd_power_en(unsigned char enabled)
         
       #ifdef BUILD_LK
         //VGP6 3.3V
-        pmic_config_interface(DIGLDO_CON12, 0x0, PMIC_RG_VGP6_EN_MASK, PMIC_RG_VGP6_EN_SHIFT); 
-        pmic_config_interface(DIGLDO_CON33, 0x0, PMIC_RG_VGP6_VOSEL_MASK, PMIC_RG_VGP6_VOSEL_SHIFT);   
+        //pmic_config_interface(DIGLDO_CON12, 0x0, PMIC_RG_VGP6_EN_MASK, PMIC_RG_VGP6_EN_SHIFT); 
+        //pmic_config_interface(DIGLDO_CON33, 0x0, PMIC_RG_VGP6_VOSEL_MASK, PMIC_RG_VGP6_VOSEL_SHIFT);   
+
+		pmic_config_interface(0x424, 0x0, 0x1, 15); 
+		pmic_config_interface(0x45a, 0x0, 0x07, 5);
       #else
         hwPowerDown(MT65XX_POWER_LDO_VGP6, "LCM");
       #endif     	
@@ -152,9 +167,10 @@ static void lcm_get_params(LCM_PARAMS *params)
 		params->dsi.horizontal_active_pixel 			= FRAME_WIDTH;
 
 		// Bit rate calculation
-		params->dsi.pll_div1=0;		
-		params->dsi.pll_div2=1; 		
-		params->dsi.fbk_div =19;
+		//params->dsi.pll_div1=0;		
+		//params->dsi.pll_div2=1; 		
+		//params->dsi.fbk_div =19;
+		params->dsi.PLL_CLOCK = LCM_DSI_6589_PLL_CLOCK_260;
 		
 		params->dsi.cont_clock = 1;
     params->dsi.horizontal_bllp = 0x115; //word count=0x340
@@ -184,17 +200,35 @@ static void init_lcm_registers(void)
 static void lcm_init(void)
 {
 	#ifdef BUILD_LK
-	  return;//LK donothing
-	#else
-    lcd_bl_en(0);
+		printf("%s, LK \n", __func__);
+#else
+		printk("%s, kernel", __func__);
+#endif
+	#ifdef BUILD_LK
+	 //lcd_bl_en(0);
     lcd_reset(0);
-    lcd_power_en(0);
+    //lcd_power_en(0);
+	MDELAY(10);//Must > 5ms
     lcd_power_en(1);
-    MDELAY(50);//Must > 5ms
+    MDELAY(100);//Must > 5ms
     lcd_reset(1);
     MDELAY(200);//Must > 50ms
     init_lcm_registers();
 	  lcd_bl_en(1);
+	  return;//LK donothing
+	#else
+    //lcd_bl_en(0);
+    #if 0
+    lcd_reset(0);
+	MDELAY(10);//Must > 5ms
+   // lcd_power_en(0);
+    lcd_power_en(1);
+    MDELAY(100);//Must > 5ms
+    lcd_reset(1);
+    MDELAY(200);//Must > 50ms
+    init_lcm_registers();
+	  lcd_bl_en(1);
+	  #endif
 	#endif  
 }
 
@@ -202,7 +236,11 @@ static void lcm_init(void)
 static void lcm_suspend(void)
 {
 	  unsigned int data_array[16];
-  
+  #ifdef BUILD_LK
+		printf("%s, LK \n", __func__);
+#else
+		printk("%s, kernel", __func__);
+#endif
     data_array[0] = 0x00280500;  //display off                        
 	  dsi_set_cmdq(data_array, 1, 1);
 	  MDELAY(5);
@@ -216,11 +254,18 @@ static void lcm_suspend(void)
 
 static void lcm_resume(void)
 {
-    lcd_bl_en(0);
+    //lcd_bl_en(0);
+    
+	#ifdef BUILD_LK
+		printf("%s, LK \n", __func__);
+#else
+		printk("%s, kernel", __func__);
+#endif
     lcd_reset(0);
-    lcd_power_en(0);
+    //lcd_power_en(0);
+	MDELAY(10);//Must > 5ms
     lcd_power_en(1);
-    MDELAY(50);//Must > 5ms
+    MDELAY(100);//Must > 5ms
     lcd_reset(1);
     MDELAY(200);//Must > 50ms
     init_lcm_registers();
@@ -229,7 +274,7 @@ static void lcm_resume(void)
 
 LCM_DRIVER auo_b079xat02_dsi_vdo_lcm_drv = 
 {
-    .name			= "auo_b079xat02_dsi_vdo",
+    .name			= "AUO_B079XAT02_DSI_VDO",
 	.set_util_funcs = lcm_set_util_funcs,
 	.get_params     = lcm_get_params,
 	.init           = lcm_init,
@@ -237,4 +282,3 @@ LCM_DRIVER auo_b079xat02_dsi_vdo_lcm_drv =
 	.resume         = lcm_resume,
 	//.compare_id    = lcm_compare_id,
 };
-
