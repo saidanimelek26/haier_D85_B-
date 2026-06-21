@@ -2238,8 +2238,8 @@ UINT32 DISP_GetActiveHeight(void)
     disp_drv_init_context();
     if(lcm_params)
     {
-        printk("[wwy]lcm_parms->height = %d\n", lcm_params->height);
-        return lcm_params->height;
+        printk("[wwy]lcm_parms->height = %d\n", lcm_params->height);  // changed
+        return lcm_params->height;  // changed
     }
     else
     {
@@ -2253,8 +2253,8 @@ UINT32 DISP_GetActiveWidth(void)
     disp_drv_init_context();
     if(lcm_params)
     {
-        printk("[wwy]lcm_parms->width = %d\n", lcm_params->width);
-        return lcm_params->width;
+        printk("[wwy]lcm_parms->width = %d\n", lcm_params->width);  // changed
+        return lcm_params->width;  // changed
     }
     else
     {
@@ -2262,7 +2262,6 @@ UINT32 DISP_GetActiveWidth(void)
         return 0;
     }
 }
-
 UINT32 DISP_GetPhysicalHeight(void)
 {
     disp_drv_init_context();
